@@ -7,10 +7,9 @@
 #include "../common/TracyForceInline.hpp"
 #include "TracyCallstack.h"
 
-// External target API: desktop Linux only. The tracy-monitor that drives
-// it builds for Linux x86_64/aarch64 only, and Android, although __linux__,
-// lacks process_vm_readv on 32-bit ABIs.
-#if defined(__linux__) && !defined(__ANDROID__) && defined(TRACY_HAS_CALLSTACK)
+// External target API: desktop Linux and Windows.
+#if (defined(__linux__) && !defined(__ANDROID__) && defined(TRACY_HAS_CALLSTACK)) || \
+    (defined(_WIN32) && !defined(TRACY_WIN32_NO_DESKTOP) && defined(TRACY_HAS_CALLSTACK))
 #  define TRACY_HAS_EXTERNAL_TARGET
 #endif
 
@@ -96,7 +95,7 @@ void EndCallstack();
 const char* GetKernelModulePath( uint64_t addr );
 
 #ifdef TRACY_HAS_EXTERNAL_TARGET
-bool InitExternalTarget( pid_t targetPid );
+bool InitExternalTarget( uint32_t targetPid );
 uint32_t GetExternalTargetPid();
 const char* GetExternalTargetName();
 uint64_t GetExternalTargetExeTime();

@@ -184,7 +184,11 @@ bool SysTraceStart( int64_t& samplingPeriod )
 {
     if( !_GetThreadDescription ) _GetThreadDescription = (t_GetThreadDescription)GetProcAddress( GetModuleHandleA( "kernel32.dll" ), "GetThreadDescription" );
 
+#ifdef TRACY_HAS_EXTERNAL_TARGET
+    s_pid = GetExternalTargetPid() != 0 ? GetExternalTargetPid() : GetCurrentProcessId();
+#else
     s_pid = GetCurrentProcessId();
+#endif
 
     if( !etw::CheckAdminPrivilege() )
         return false;

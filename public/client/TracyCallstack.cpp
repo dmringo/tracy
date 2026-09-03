@@ -346,7 +346,7 @@ void DestroyImageCaches()
 }
 
 
-#ifdef TRACY_HAS_EXTERNAL_TARGET
+#if defined TRACY_HAS_EXTERNAL_TARGET && defined __linux__
 #  include <errno.h>
 #  include <fcntl.h>
 #  include <signal.h>
@@ -635,7 +635,7 @@ static void ExternalSymInfoCb( void* data, uintptr_t pc, const char* symname, ui
     sd.symsize = symsize;
 }
 
-bool InitExternalTarget( pid_t targetPid )
+bool InitExternalTarget( uint32_t targetPid )
 {
     if( kill( targetPid, 0 ) != 0 )
     {
@@ -771,7 +771,7 @@ size_t ReadExternalTargetMemory( uint64_t addr, uint32_t size, char* buf )
     return 0;
 }
 
-#endif // TRACY_HAS_EXTERNAL_TARGET
+#endif // TRACY_HAS_EXTERNAL_TARGET && __linux__
 
 
 // when "TRACY_SYMBOL_OFFLINE_RESOLVE" is set, instead of fully resolving symbols at runtime,
@@ -788,6 +788,94 @@ bool ShouldResolveSymbolsOffline()
 #endif // #ifdef TRACY_SYMBOL_OFFLINE_RESOLVE
 
 #if TRACY_HAS_CALLSTACK == 1
+
+#ifdef TRACY_HAS_EXTERNAL_TARGET
+static HANDLE s_externalTargetProcess = NULL;
+static uint32_t s_externalTargetPid = 0;
+static char s_externalTargetName[64] = {};
+static uint64_t s_externalTargetExeMtime = 0;
+
+static inline HANDLE GetDbgHelpProcess()
+{
+    return s_externalTargetProcess != NULL ? s_externalTargetProcess : GetCurrentProcess();
+}
+
+bool InitExternalTarget( uint32_t targetPid )
+{
+    HANDLE hProcess = OpenProcess( PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE, FALSE, targetPid );
+    if( !hProcess )
+    {
+        fprintf( stderr, "Tracy: cannot open process %u: %lu\n", targetPid, GetLastError() );
+        return false;
+    }
+
+    char exePath[MAX_PATH] = {};
+    DWORD pathLen = sizeof( exePath );
+    if( !QueryFullProcessImageNameA( hProcess, 0, exePath, &pathLen ) || pathLen == 0 )
+    {
+        fprintf( stderr, "Tracy: cannot get process name for %u: %lu\n", targetPid, GetLastError() );
+        CloseHandle( hProcess );
+        return false;
+    }
+
+    const char* baseName = exePath + pathLen;
+    while( baseName > exePath && *(baseName - 1) != '\\' && *(baseName - 1) != '/' ) baseName--;
+    size_t nameLen = ( exePath + pathLen ) - baseName;
+    if( nameLen >= sizeof( s_externalTargetName ) ) nameLen = sizeof( s_externalTargetName ) - 1;
+    memcpy( s_externalTargetName, baseName, nameLen );
+    s_externalTargetName[nameLen] = '\0';
+
+    HANDLE hFile = CreateFileA( exePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr );
+    if( hFile != INVALID_HANDLE_VALUE )
+    {
+        FILETIME ftWrite;
+        if( GetFileTime( hFile, nullptr, nullptr, &ftWrite ) )
+        {
+            ULARGE_INTEGER uli;
+            uli.LowPart = ftWrite.dwLowDateTime;
+            uli.HighPart = ftWrite.dwHighDateTime;
+            s_externalTargetExeMtime = ( uli.QuadPart - 116444736000000000ULL ) / 10000000ULL;
+        }
+        CloseHandle( hFile );
+    }
+
+    s_externalTargetPid = targetPid;
+    s_externalTargetProcess = hProcess;
+    return true;
+}
+
+uint32_t GetExternalTargetPid()
+{
+    return s_externalTargetPid;
+}
+
+const char* GetExternalTargetName()
+{
+    return s_externalTargetName;
+}
+
+uint64_t GetExternalTargetExeTime()
+{
+    return s_externalTargetExeMtime;
+}
+
+size_t ReadExternalTargetMemory( uint64_t addr, uint32_t size, char* buf )
+{
+    if( s_externalTargetProcess == NULL || size == 0 ) return 0;
+    SIZE_T bytesRead = 0;
+    if( ReadProcessMemory( s_externalTargetProcess, (LPCVOID)addr, buf, size, &bytesRead ) && bytesRead == size )
+    {
+        return size;
+    }
+    return 0;
+}
+#else
+static inline HANDLE GetDbgHelpProcess()
+{
+    return GetCurrentProcess();
+}
+#endif
 
 constexpr size_t MaxCbTrace = 64;
 constexpr size_t MaxNameSize = 8*1024;
@@ -859,15 +947,30 @@ void DbgHelpInit()
     {
         buffer[length] = ';';
         buffer[++length] = '\0';
-        length += GetModuleFileNameA( NULL, &buffer[length], sizeof( buffer ) - length );
-        if( length >= sizeof( buffer ) && GetLastError() == ERROR_INSUFFICIENT_BUFFER )
+#ifdef TRACY_HAS_EXTERNAL_TARGET
+        if( s_externalTargetProcess != NULL )
         {
-            SymError( "GetModuleFileNameA", GetLastError() );
+            DWORD pathLen = sizeof( buffer ) - length;
+            if( QueryFullProcessImageNameA( s_externalTargetProcess, 0, &buffer[length], &pathLen ) )
+            {
+                length += pathLen;
+                while( length > 0 && buffer[--length] != '\\' && buffer[length] != '/' )
+                    buffer[length] = '\0';
+            }
         }
         else
+#endif
         {
-            while( length > 0 && buffer[--length] != '\\' )
-                buffer[length] = '\0';
+            length += GetModuleFileNameA( NULL, &buffer[length], sizeof( buffer ) - length );
+            if( length >= sizeof( buffer ) && GetLastError() == ERROR_INSUFFICIENT_BUFFER )
+            {
+                SymError( "GetModuleFileNameA", GetLastError() );
+            }
+            else
+            {
+                while( length > 0 && buffer[--length] != '\\' )
+                    buffer[length] = '\0';
+            }
         }
     }
 
@@ -875,7 +978,7 @@ void DbgHelpInit()
     if( SetEnvironmentVariableA( "_NT_SYMBOL_PATH", buffer ) == FALSE ) SymError( "SetEnvironmentVariableA", GetLastError() );
  
     SymSetOptions( SymGetOptions() | SYMOPT_LOAD_LINES );
-    if( SymInitialize( GetCurrentProcess(), NULL, TRUE ) == FALSE )
+    if( SymInitialize( GetDbgHelpProcess(), NULL, TRUE ) == FALSE )
     {
         SymError( "SymInitialize", GetLastError() );
     }
@@ -893,7 +996,7 @@ void DbgHelpInit()
 DWORD64 DbgHelpLoadSymbolsForModule( const char* imageName, uint64_t baseOfDll, uint32_t bllSize )
 {
     if( s_shouldResolveSymbolsOffline ) return 0;
-    return SymLoadModuleEx( GetCurrentProcess(), nullptr, imageName, nullptr, baseOfDll, bllSize, nullptr, 0 );
+    return SymLoadModuleEx( GetDbgHelpProcess(), nullptr, imageName, nullptr, baseOfDll, bllSize, nullptr, 0 );
 }
 
 char* FormatImageName( const char* imageName, uint32_t imageNameLength )
@@ -992,7 +1095,7 @@ static void CacheProcessDrivers()
 static void CacheProcessModules()
 {
     DWORD needed;
-    HANDLE proc = GetCurrentProcess();
+    HANDLE proc = GetDbgHelpProcess();
     HMODULE mod[1024];
     if( EnumProcessModules( proc, mod, sizeof( mod ), &needed ) != 0 )
     {
@@ -1003,7 +1106,7 @@ static void CacheProcessModules()
             if( GetModuleInformation( proc, mod[i], &info, sizeof( info ) ) != 0 )
             {
                 char name[1024];
-                const auto nameLength = GetModuleFileNameA( mod[i], name, 1021 );
+                const auto nameLength = GetModuleFileNameExA( proc, mod[i], name, 1021 );
                 if( nameLength > 0 )
                 {
                     // This may be a new module loaded since our call to SymInitialize.
@@ -1057,6 +1160,15 @@ void InitCallstack()
 void EndCallstack()
 {
     DestroyImageCaches();
+#if defined TRACY_HAS_EXTERNAL_TARGET && TRACY_HAS_CALLSTACK == 1
+    if( s_externalTargetProcess != NULL )
+    {
+        SymCleanup( s_externalTargetProcess );
+        CloseHandle( s_externalTargetProcess );
+        s_externalTargetProcess = NULL;
+        s_externalTargetPid = 0;
+    }
+#endif
 }
 
 const char* DecodeCallstackPtrFast( uint64_t ptr )
@@ -1064,7 +1176,7 @@ const char* DecodeCallstackPtrFast( uint64_t ptr )
     if( s_shouldResolveSymbolsOffline ) return "[unresolved]";
 
     static char ret[MaxNameSize];
-    const auto proc = GetCurrentProcess();
+    const auto proc = GetDbgHelpProcess();
 
     char buf[sizeof( SYMBOL_INFO ) + MaxNameSize];
     auto si = (SYMBOL_INFO*)buf;
@@ -1116,7 +1228,19 @@ ModuleNameAndBaseAddress GetModuleNameAndPrepareSymbols( uint64_t addr )
     const ImageEntry* entry = s_imageCache->GetImageForAddress( addr );
     if( entry != nullptr ) return ModuleNameAndBaseAddress{ entry->m_name, entry->m_startAddress };
 
-    HANDLE proc = GetCurrentProcess();
+    HANDLE proc = GetDbgHelpProcess();
+#ifdef TRACY_HAS_EXTERNAL_TARGET
+    if( s_externalTargetProcess != NULL )
+    {
+        typedef BOOL (WINAPI *t_SymRefreshModuleList)( HANDLE );
+        static t_SymRefreshModuleList _SymRefreshModuleList = (t_SymRefreshModuleList)GetProcAddress( GetModuleHandleA( "dbghelp.dll" ), "SymRefreshModuleList" );
+        if( _SymRefreshModuleList ) _SymRefreshModuleList( proc );
+        CacheProcessModules();
+        entry = s_imageCache->GetImageForAddress( addr );
+        if( entry != nullptr ) return ModuleNameAndBaseAddress{ entry->m_name, entry->m_startAddress };
+        return ModuleNameAndBaseAddress{ "[unknown]", 0x0 };
+    }
+#endif
     // Do not use FreeLibrary because we set the flag GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT
     // see https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandleexa to get more information
     constexpr DWORD flag = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
@@ -1164,7 +1288,7 @@ CallstackSymbolData DecodeSymbolAddress( uint64_t ptr )
 #ifdef TRACY_DBGHELP_LOCK
     DBGHELP_LOCK;
 #endif
-    const auto res = SymGetLineFromAddr64( GetCurrentProcess(), ptr, &displacement, &line );
+    const auto res = SymGetLineFromAddr64( GetDbgHelpProcess(), ptr, &displacement, &line );
     if( res == 0 || line.LineNumber >= 0xF00000 )
     {
         sym.file = "[unknown]";
@@ -1214,7 +1338,7 @@ CallstackEntryData DecodeCallstackPtr( uint64_t ptr )
     }
 
     int write;
-    const auto proc = GetCurrentProcess();
+    const auto proc = GetDbgHelpProcess();
 
 #if !defined TRACY_NO_CALLSTACK_INLINES
     BOOL doInline = FALSE;
