@@ -14,11 +14,12 @@ project(
     VERSION ${TRACY_VERSION_STRING}
 )
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "tracy-monitor is Linux-only")
+if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
+    message(FATAL_ERROR "tracy-monitor supports Linux and Windows")
 endif()
-if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|aarch64|arm64)$")
-    message(FATAL_ERROR "tracy-monitor supports x86_64 and aarch64")
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _PROCESSOR_LOWER)
+if(NOT _PROCESSOR_LOWER MATCHES "^(x86_64|amd64|aarch64|arm64)$")
+    message(FATAL_ERROR "tracy-monitor supports x86_64 and aarch64 (got ${CMAKE_SYSTEM_PROCESSOR})")
 endif()
 
 find_package(Threads REQUIRED)
@@ -49,9 +50,13 @@ endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE
     TracyServer
     TracyUtil
+    TracyGetOpt
     Threads::Threads
     ${CMAKE_DL_LIBS}
 )
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 dbghelp advapi32)
+endif()
 
 add_git_ref(${PROJECT_NAME})
 

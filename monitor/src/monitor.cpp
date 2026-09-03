@@ -4,27 +4,46 @@
 // "external mode". With TRACY_ON_DEMAND, samples are captured only while a
 // Tracy server is connected. See --help for usage and permission requirements.
 //
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <getopt.h>
 #include <memory>
-#include <sys/ioctl.h>
-#include <linux/perf_event.h>
-#include <netinet/in.h>
+
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <tlhelp32.h>
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <io.h>
+#  include <process.h>
+#  include <getopt.h>
+#else
+#  include <dirent.h>
+#  include <errno.h>
+#  include <fcntl.h>
+#  include <getopt.h>
+#  include <sys/ioctl.h>
+#  include <linux/perf_event.h>
+#  include <netinet/in.h>
+#  include <sys/mman.h>
+#  include <sys/resource.h>
+#  include <sys/ptrace.h>
+#  include <sys/socket.h>
+#  include <sys/stat.h>
+#  include <sys/syscall.h>
+#  include <sys/wait.h>
+#  include <unistd.h>
+#endif
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/resource.h>
-#include <sys/ptrace.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include <string>
+#include <vector>
 
 #include "../public/tracy/Tracy.hpp"
 #include "../public/common/TracyVersion.hpp"
@@ -55,6 +74,62 @@
 #  error "tracy-monitor starts sampling itself via StartupProfiler(): TRACY_SAMPLING_PROFILER_MANUAL_START is not supported"
 #endif
 
+static void SetEnv( const char* key, const char* val )
+{
+#ifdef _WIN32
+    _putenv_s( key, val );
+#else
+    setenv( key, val, 1 );
+#endif
+}
+
+static void UnsetEnv( const char* key )
+{
+#ifdef _WIN32
+    _putenv_s( key, "" );
+#else
+    unsetenv( key );
+#endif
+}
+
+static void SleepMs( uint32_t ms )
+{
+#ifdef _WIN32
+    Sleep( ms );
+#else
+    usleep( ms * 1000 );
+#endif
+}
+
+static void CloseSocket( int s )
+{
+#ifdef _WIN32
+    closesocket( s );
+#else
+    close( s );
+#endif
+}
+
+// --- signal and shutdown handling --------------------------------------------
+
+#ifdef _WIN32
+static volatile int s_shouldQuit = 0;
+static HANDLE s_childProcess = NULL;
+
+static BOOL WINAPI ConsoleCtrlHandler( DWORD ctrlType )
+{
+    switch( ctrlType )
+    {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+        s_shouldQuit = 1;
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+#else
 static volatile sig_atomic_t s_shouldQuit = 0;
 static pid_t s_targetPid = 0;
 static bool s_isForked = false;
@@ -69,7 +144,20 @@ static void SignalHandler( int /*sig*/ )
         kill( s_targetPid, SIGINT );
     }
 }
+#endif
 
+// --- process liveness --------------------------------------------------------
+
+#ifdef _WIN32
+static bool ProcessIsAlive( uint32_t pid )
+{
+    HANDLE h = OpenProcess( SYNCHRONIZE, FALSE, pid );
+    if( !h ) return false;
+    const DWORD res = WaitForSingleObject( h, 0 );
+    CloseHandle( h );
+    return res == WAIT_TIMEOUT;
+}
+#else
 // kill( pid, 0 ) succeeds even for zombies, so liveness also checks the
 // /proc state: a zombie is dead - nothing left to sample, and in attach
 // mode we are not the parent, so we can neither reap it nor learn its exit.
@@ -88,8 +176,258 @@ static bool ProcessIsAlive( pid_t pid )
     const char* state = strrchr( buf, ')' );
     return state && state[1] == ' ' && state[2] != 'Z' && state[2] != '\0';
 }
+#endif
 
-// --- capability probes --------------------------------------------------
+// --- configuration helpers ---------------------------------------------------
+
+static const char* FormatHz( int hz )
+{
+    static char buf[32];
+    if( hz >= 1000 && hz % 1000 == 0 )
+    {
+        snprintf( buf, sizeof( buf ), "%d kHz", hz / 1000 );
+    }
+    else
+    {
+        snprintf( buf, sizeof( buf ), "%d Hz", hz );
+    }
+    return buf;
+}
+
+static int EffectiveSamplingHz()
+{
+    const char* env = getenv( "TRACY_SAMPLING_HZ" );
+    int hz = 8000;
+#ifdef __linux__
+    hz = 10000; // client default on Linux
+#endif
+    if( env )
+    {
+        const int parsed = atoi( env );
+        if( parsed > 0 ) hz = ( parsed > 1000000 ) ? 1000000 : parsed;
+    }
+#ifdef __linux__
+    // mirror the client's clamp: the kernel caps the rate at perf_event_max_sample_rate
+    FILE* f = fopen( "/proc/sys/kernel/perf_event_max_sample_rate", "r" );
+    if( f )
+    {
+        int sysMax = 0;
+        if( fscanf( f, "%d", &sysMax ) == 1 && sysMax > 0 && sysMax < hz ) hz = sysMax;
+        fclose( f );
+    }
+#elif defined _WIN32
+    if( hz > 8000 ) hz = 8000; // client clamp on Windows
+#endif
+    return hz;
+}
+
+static int EffectivePort()
+{
+    const char* env = getenv( "TRACY_PORT" );
+    if( env )
+    {
+        const int port = atoi( env );
+        if( port > 0 && port <= 65535 ) return port;
+    }
+    return 8086;
+}
+
+static bool VerifyClientListening()
+{
+    for( int i = 0; i < 40; i++ )
+    {
+        if( tracy::IsDataPortListening() ) return true;
+        SleepMs( 125 );
+    }
+    return false;
+}
+
+// Reserve the first free port in the client's 8086..8105 scan range and hand the
+// probe socket to the client (SetReservedListenSocket) so the reservation is atomic.
+static bool ProbeClientBind( int port, bool ipv4Only, bool onlyLocalhost, int& fdOut )
+{
+#ifdef _WIN32
+    WSADATA wsaData;
+    if( WSAStartup( MAKEWORD( 2, 2 ), &wsaData ) != 0 ) return false;
+#endif
+    fdOut = -1;
+    int s = -1;
+    int family = AF_INET6;
+    if( !ipv4Only ) s = (int)socket( AF_INET6, SOCK_STREAM, 0 );
+    if( s < 0 )
+    {
+        family = AF_INET;
+        s = (int)socket( AF_INET, SOCK_STREAM, 0 );
+    }
+    if( s < 0 ) return false;
+#ifndef _WIN32
+    fcntl( s, F_SETFD, FD_CLOEXEC );
+#endif
+    int val = 1;
+    setsockopt( s, SOL_SOCKET, SO_REUSEADDR, (const char*)&val, sizeof( val ) );
+    bool ok = false;
+    if( family == AF_INET6 )
+    {
+        sockaddr_in6 addr = {};
+        addr.sin6_family = AF_INET6;
+        if( onlyLocalhost ) addr.sin6_addr = in6addr_loopback;
+        addr.sin6_port = htons( (uint16_t)port );
+        ok = bind( s, (sockaddr*)&addr, sizeof( addr ) ) == 0 && listen( s, 4 ) == 0;
+    }
+    else
+    {
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = onlyLocalhost ? htonl( INADDR_LOOPBACK ) : INADDR_ANY;
+        addr.sin_port = htons( (uint16_t)port );
+        ok = bind( s, (sockaddr*)&addr, sizeof( addr ) ) == 0 && listen( s, 4 ) == 0;
+    }
+    if( ok )
+    {
+        fdOut = s;
+    }
+    else
+    {
+        CloseSocket( s );
+    }
+    return ok;
+}
+
+static void ReservePortIfUnpinned()
+{
+    if( getenv( "TRACY_PORT" ) ) return;
+    const char* onlyIPv4 = getenv( "TRACY_ONLY_IPV4" );
+    const char* onlyLocalhost = getenv( "TRACY_ONLY_LOCALHOST" );
+    const bool ipv4Only = onlyIPv4 && onlyIPv4[0] == '1';
+    const bool localhost = onlyLocalhost && onlyLocalhost[0] == '1';
+    for( int i=0; i<20; i++ )
+    {
+        const int port = 8086 + i;
+        int fd = -1;
+        if( ProbeClientBind( port, ipv4Only, localhost, fd ) )
+        {
+            char buf[8];
+            snprintf( buf, sizeof( buf ), "%d", port );
+            SetEnv( "TRACY_PORT", buf );
+            tracy::SetReservedListenSocket( fd );
+            return;
+        }
+    }
+}
+
+// --- trace saving ---------------------------------------------------------------
+
+// No-op until the worker's first rate sample arrives and when stdout is not a terminal.
+static void PrintProgress( tracy::Worker* worker )
+{
+    if( !worker || !worker->HasData() ) return;
+    PrintCaptureProgress( *worker, worker->GetFirstTime(), -1 );
+}
+
+// True when the status line actually occupies the current line, so that a
+// newline is needed to terminate it. PrintCaptureProgress skips rendering
+// until the first rate sample arrives, and printing a bare "\n" then would
+// add a stray blank line.
+static bool ProgressLineActive( tracy::Worker* worker )
+{
+    if( !worker || !IsTerminal() ) return false;
+    auto& lock = worker->GetMbpsDataLock();
+    lock.lock();
+    const bool active = !worker->GetMbpsData().empty();
+    lock.unlock();
+    return active;
+}
+
+static bool WaitForWorker( tracy::Worker& worker, const char** reasonOut )
+{
+    *reasonOut = nullptr;
+    for( int i = 0; i < 100; i++ )
+    {
+        if( worker.HasData() ) return true;
+        if( s_shouldQuit )
+        {
+            *reasonOut = "interrupted before the capture started";
+            return false;
+        }
+        const auto hs = worker.GetHandshakeStatus();
+        if( hs != tracy::HandshakePending )
+        {
+            // the first connection was made and rejected or dropped; the worker
+            // never reconnects, so this outcome is final
+            switch( (tracy::HandshakeStatus)hs )
+            {
+            case tracy::HandshakeProtocolMismatch:
+                *reasonOut = "the client rejected the protocol version (the client and the worker come from the same build; this should not happen)";
+                break;
+            case tracy::HandshakeNotAvailable:
+                *reasonOut = "another server (e.g. the Tracy profiler GUI) is already connected to the client, and the client serves only one server at a time";
+                break;
+            default:
+                *reasonOut = "the client dropped the connection during the handshake";
+                break;
+            }
+            return false;
+        }
+        PrintProgress( &worker );
+        SleepMs( 100 );
+    }
+    *reasonOut = "the worker did not connect to the client within 10 seconds";
+    return false;
+}
+
+// All of the client's data has reached the worker by the time this runs.
+static int SaveTrace( tracy::Worker& worker, const char* output )
+{
+    // IsConnected() flips only after the last data was processed, so this
+    // also bounds the worker's own teardown.
+    while( worker.IsConnected() )
+    {
+        SleepMs( 100 );
+    }
+
+    const auto failure = worker.GetFailureType();
+    if( failure != tracy::Worker::Failure::None )
+    {
+        fprintf( stderr, "Capture failure: %s\n", tracy::Worker::GetFailureString( failure ) );
+        const auto& fd = worker.GetFailureData();
+        if( !fd.message.empty() )
+        {
+            fprintf( stderr, "Context: %s\n", fd.message.c_str() );
+        }
+    }
+
+    if( !worker.HasData() )
+    {
+        fprintf( stderr, "No trace saved: the worker received no data from the client.\n" );
+        tracy::RestoreOutputBackup();
+        return 1;
+    }
+
+    printf( "Time span: %s, callstack samples: %s\n",
+        tracy::TimeToString( worker.GetLastTime() - worker.GetFirstTime() ),
+        tracy::RealToString( worker.GetCallstackSampleCount() ) );
+    printf( "Saving trace to %s...", output );
+    fflush( stdout );
+
+    auto f = std::unique_ptr<tracy::FileWrite>( tracy::FileWrite::Open( output, tracy::FileCompression::Zstd, 3, 4 ) );
+    if( !f )
+    {
+        fprintf( stderr, "\nCannot open output file %s for writing!\n", output );
+        tracy::RestoreOutputBackup();
+        return 5;
+    }
+    worker.Write( *f, false );
+    f->Finish();
+    const auto stats = f->GetCompressionStatistics();
+    printf( " done\nTrace size %s (%.2f%% ratio)\n", tracy::MemSizeToString( stats.second ), 100.f * stats.second / stats.first );
+    tracy::DiscardOutputBackup();
+    return 0;
+}
+
+// =============================================================================
+// Linux Implementation
+// =============================================================================
+#ifdef __linux__
 
 static const char* GetTraceFsPath()
 {
@@ -127,8 +465,6 @@ static const char* GetTraceFsPath()
 
 enum class TracepointStatus { Open, NoTraceFs, IdNotReadable, OpenDenied };
 
-// open a system-wide per-CPU tracepoint (the client's sched/vblank shape);
-// report the failure distinctly - tracefs readability (root) and the perf open (paranoid/CAP_PERFMON) are independent gates.
 static TracepointStatus CheckSystemWideTracepoint( const char* eventPath )
 {
     const char* traceFs = GetTraceFsPath();
@@ -158,7 +494,6 @@ static TracepointStatus CheckSystemWideTracepoint( const char* eventPath )
     return TracepointStatus::Open;
 }
 
-// Power plots read RAPL energy counters (the client scans the same tree).
 static bool CanReadRapl()
 {
     const char* base = "/sys/devices/virtual/powercap/intel-rapl";
@@ -183,12 +518,6 @@ static bool CanReadRapl()
     return ok;
 }
 
-// --- sampling preflight ---------------------------------------------------
-
-// verify the per-CPU pid-filtered event mechanism the client relies on:
-// perf_event_open(attr, target, cpu) with a direct mmap of the event's ring
-// (the normal client's own topology); exclude_kernel=1 so it works at any
-// paranoid level.
 static bool PreflightOutputMechanism( pid_t pid )
 {
     perf_event_attr pe = {};
@@ -218,8 +547,6 @@ static bool PreflightOutputMechanism( pid_t pid )
     return ok;
 }
 
-// probe whether the client's per-thread hardware PMU counters can open at all
-// (the client drops them silently on failure, losing the IPC/cache/branch plots); informational only.
 static bool ProbeHwCounters( pid_t pid, int& errOut )
 {
     perf_event_attr pe = {};
@@ -248,10 +575,6 @@ static bool ProbeHwCounters( pid_t pid, int& errOut )
     return false;
 }
 
-// mirror the client's exact external perf_event_open (SysTraceStart/OpenSampleEvent):
-// a per-CPU event with a pid filter on the target (direct ring mmap), plus an
-// informational hardware PMU probe. Failing fast here yields an accurate
-// capability report instead of starting the profiler with no samples.
 static bool PreflightSamplingEvent( pid_t pid, bool& kernelFrames, bool& hwStats, int& hwErrno )
 {
     perf_event_attr pe = {};
@@ -275,7 +598,6 @@ static bool PreflightSamplingEvent( pid_t pid, bool& kernelFrames, bool& hwStats
         }
         if( err == EACCES || err == EPERM )
         {
-            // no kernel access: retry user-space-only, in both the event and the callchain
             pe.exclude_kernel = 1;
             pe.exclude_callchain_kernel = 1;
             dataFd = syscall( __NR_perf_event_open, &pe, pid, 0, -1, 0 );
@@ -287,8 +609,6 @@ static bool PreflightSamplingEvent( pid_t pid, bool& kernelFrames, bool& hwStats
         }
         else
         {
-            // any other error (EINVAL, ENOSYS under seccomp, exhaustion): the client's same
-            // event shape would fail identically and produce an empty capture, so fail here.
             fprintf( stderr, "Cannot open perf events for pid %d: %s\n", (int)pid, strerror( err ) );
             return false;
         }
@@ -321,53 +641,6 @@ static bool PreflightSamplingEvent( pid_t pid, bool& kernelFrames, bool& hwStats
     }
     hwStats = ProbeHwCounters( pid, hwErrno );
     return true;
-}
-
-// --- reporting --------------------------------------------------------------
-
-static const char* FormatHz( int hz )
-{
-    static char buf[32];
-    if( hz >= 1000 && hz % 1000 == 0 )
-    {
-        snprintf( buf, sizeof( buf ), "%d kHz", hz / 1000 );
-    }
-    else
-    {
-        snprintf( buf, sizeof( buf ), "%d Hz", hz );
-    }
-    return buf;
-}
-
-static int EffectiveSamplingHz()
-{
-    const char* env = getenv( "TRACY_SAMPLING_HZ" );
-    int hz = 10000; // client default on Linux
-    if( env )
-    {
-        const int parsed = atoi( env );
-        if( parsed > 0 ) hz = ( parsed > 1000000 ) ? 1000000 : parsed;
-    }
-    // mirror the client's clamp: the kernel caps the rate at perf_event_max_sample_rate
-    FILE* f = fopen( "/proc/sys/kernel/perf_event_max_sample_rate", "r" );
-    if( f )
-    {
-        int sysMax = 0;
-        if( fscanf( f, "%d", &sysMax ) == 1 && sysMax > 0 && sysMax < hz ) hz = sysMax;
-        fclose( f );
-    }
-    return hz;
-}
-
-static int EffectivePort()
-{
-    const char* env = getenv( "TRACY_PORT" );
-    if( env )
-    {
-        const int port = atoi( env );
-        if( port > 0 && port <= 65535 ) return port;
-    }
-    return 8086;
 }
 
 static const char* TracepointReason( TracepointStatus status )
@@ -431,117 +704,7 @@ static void PrintStartupReport( bool kernelFrames, bool hwStats, int hwErrno, co
     fflush( stdout );
 }
 
-// --- trace saving ---------------------------------------------------------------
-
-// No-op until the worker's first rate sample arrives and when stdout is not a terminal.
-static void PrintProgress( tracy::Worker* worker )
-{
-    if( !worker || !worker->HasData() ) return;
-    PrintCaptureProgress( *worker, worker->GetFirstTime(), -1 );
-}
-
-// True when the status line actually occupies the current line, so that a
-// newline is needed to terminate it. PrintCaptureProgress skips rendering
-// until the first rate sample arrives, and printing a bare "\n" then would
-// add a stray blank line.
-static bool ProgressLineActive( tracy::Worker* worker )
-{
-    if( !worker || !IsTerminal() ) return false;
-    auto& lock = worker->GetMbpsDataLock();
-    lock.lock();
-    const bool active = !worker->GetMbpsData().empty();
-    lock.unlock();
-    return active;
-}
-
-static bool WaitForWorker( tracy::Worker& worker, const char** reasonOut )
-{
-    *reasonOut = nullptr;
-    for( int i = 0; i < 100; i++ )
-    {
-        if( worker.HasData() ) return true;
-        if( s_shouldQuit )
-        {
-            *reasonOut = "interrupted before the capture started";
-            return false;
-        }
-        const auto hs = worker.GetHandshakeStatus();
-        if( hs != tracy::HandshakePending )
-        {
-            // the first connection was made and rejected or dropped; the worker
-            // never reconnects, so this outcome is final
-            switch( (tracy::HandshakeStatus)hs )
-            {
-            case tracy::HandshakeProtocolMismatch:
-                *reasonOut = "the client rejected the protocol version (the client and the worker come from the same build; this should not happen)";
-                break;
-            case tracy::HandshakeNotAvailable:
-                *reasonOut = "another server (e.g. the Tracy profiler GUI) is already connected to the client, and the client serves only one server at a time";
-                break;
-            default:
-                *reasonOut = "the client dropped the connection during the handshake";
-                break;
-            }
-            return false;
-        }
-        PrintProgress( &worker );
-        usleep( 100000 );
-    }
-    *reasonOut = "the worker did not connect to the client within 10 seconds";
-    return false;
-}
-
-// All of the client's data has reached the worker by the time this runs.
-static int SaveTrace( tracy::Worker& worker, const char* output )
-{
-    // IsConnected() flips only after the last data was processed, so this
-    // also bounds the worker's own teardown.
-    while( worker.IsConnected() )
-    {
-        usleep( 100000 );
-    }
-
-    const auto failure = worker.GetFailureType();
-    if( failure != tracy::Worker::Failure::None )
-    {
-        fprintf( stderr, "Capture failure: %s\n", tracy::Worker::GetFailureString( failure ) );
-        const auto& fd = worker.GetFailureData();
-        if( !fd.message.empty() )
-        {
-            fprintf( stderr, "Context: %s\n", fd.message.c_str() );
-        }
-    }
-
-    if( !worker.HasData() )
-    {
-        fprintf( stderr, "No trace saved: the worker received no data from the client.\n" );
-        tracy::RestoreOutputBackup();
-        return 1;
-    }
-
-    printf( "Time span: %s, callstack samples: %s\n",
-        tracy::TimeToString( worker.GetLastTime() - worker.GetFirstTime() ),
-        tracy::RealToString( worker.GetCallstackSampleCount() ) );
-    printf( "Saving trace to %s...", output );
-    fflush( stdout );
-
-    auto f = std::unique_ptr<tracy::FileWrite>( tracy::FileWrite::Open( output, tracy::FileCompression::Zstd, 3, 4 ) );
-    if( !f )
-    {
-        fprintf( stderr, "\nCannot open output file %s for writing!\n", output );
-        tracy::RestoreOutputBackup();
-        return 5;
-    }
-    worker.Write( *f, false );
-    f->Finish();
-    const auto stats = f->GetCompressionStatistics();
-    printf( " done\nTrace size %s (%.2f%% ratio)\n", tracy::MemSizeToString( stats.second ), 100.f * stats.second / stats.first );
-    tracy::DiscardOutputBackup();
-    return 0;
-}
-
 // --- attach mode ---------------------------------------------------------------
-
 static int FindPidsByComm( const char* name, pid_t* outPids, int maxPids )
 {
     int count = 0;
@@ -562,7 +725,6 @@ static int FindPidsByComm( const char* name, pid_t* outPids, int maxPids )
             while( len > 0 && ( comm[len-1] == '\n' || comm[len-1] == '\r' ) ) comm[--len] = '\0';
             if( strcmp( comm, name ) == 0 && count < maxPids )
             {
-                // gate on /proc/<pid>/exe: zombies keep a comm but have no executable to map
                 char exe[256] = {};
                 snprintf( path, sizeof( path ), "/proc/%s/exe", ent->d_name );
                 if( readlink( path, exe, sizeof( exe ) - 1 ) >= 0 )
@@ -577,15 +739,6 @@ static int FindPidsByComm( const char* name, pid_t* outPids, int maxPids )
     return count;
 }
 
-static bool VerifyClientListening()
-{
-    for( int i = 0; i < 40; i++ )
-    {
-        if( tracy::IsDataPortListening() ) return true;
-        usleep( 125000 );
-    }
-    return false;
-}
 static int RunAttached( pid_t pid, const char* output )
 {
     if( kill( pid, 0 ) != 0 )
@@ -604,7 +757,7 @@ static int RunAttached( pid_t pid, const char* output )
     printf( "Attaching to process %d", (int)pid );
     fflush( stdout );
 
-    if( !tracy::InitExternalTarget( pid ) ) return 1;
+    if( !tracy::InitExternalTarget( (uint32_t)pid ) ) return 1;
 
     printf( " (%s)...\n", tracy::GetExternalTargetName() );
     fflush( stdout );
@@ -630,14 +783,7 @@ static int RunAttached( pid_t pid, const char* output )
 
     if( !VerifyClientListening() )
     {
-        if( const char* port = getenv( "TRACY_PORT" ) )
-        {
-            fprintf( stderr, "The client could not listen on port %s (the port is most likely in use, or the bind was denied). Retry, or choose another port with --port.\n", port );
-        }
-        else
-        {
-            fprintf( stderr, "The client could not listen on any of the scan ports 8086-8105 (they are most likely all in use, or the bind was denied). Retry, or choose another port with --port.\n" );
-        }
+        fprintf( stderr, "The client could not listen on port %d.\n", EffectivePort() );
         tracy::ShutdownProfiler();
         return 1;
     }
@@ -661,11 +807,10 @@ static int RunAttached( pid_t pid, const char* output )
         }
     }
 
-    // never signal the target: attach mode must leave it running when we quit
     while( !s_shouldQuit && ProcessIsAlive( pid ) )
     {
         PrintProgress( worker.get() );
-        usleep( 100000 );  // 100ms poll
+        SleepMs( 100 );  // 100ms poll
     }
 
     if( ProgressLineActive( worker.get() ) ) printf( "\n" );  // terminate the status line
@@ -697,10 +842,8 @@ static int RunForked( int argc, char** argv, const char* output )
 
     if( childPid == 0 )
     {
-        // Child process: request ptrace stop at exec, then exec the target.
-        // Don't leak the monitor's own TRACY_* env into a target that links its own client.
-        unsetenv( "TRACY_SAMPLING_HZ" );
-        unsetenv( "TRACY_PORT" );
+        UnsetEnv( "TRACY_SAMPLING_HZ" );
+        UnsetEnv( "TRACY_PORT" );
         if( ptrace( PTRACE_TRACEME, 0, nullptr, nullptr ) < 0 )
         {
             fprintf( stderr, "ptrace(TRACEME) failed: %s\n", strerror( errno ) );
@@ -711,7 +854,6 @@ static int RunForked( int argc, char** argv, const char* output )
         _exit( 2 );
     }
 
-    // Parent: wait for the child to stop at the exec boundary (SIGTRAP)
     s_targetPid = childPid;
     s_isForked = true;
 
@@ -728,15 +870,6 @@ static int RunForked( int argc, char** argv, const char* output )
 
     while( WIFSTOPPED( status ) && WSTOPSIG( status ) != SIGTRAP )
     {
-        // A caught signal (the handlers are inherited by the child) arriving between
-        // PTRACE_TRACEME and exec produces a signal-delivery stop before the exec stop.
-        // Re-inject it and keep waiting for the exec stop: running the setup on the
-        // pre-exec child would capture the monitor's own image and mis-symbolicate.
-        // Job-control signals must never be re-injected: re-delivering SIGSTOP/SIGTSTP
-        // re-stops the child, so the exec stop would never be reached (or, for a
-        // stop carrying the 0x80 job-control bit, PTRACE_CONT rejects the signal
-        // number outright). Resume those without a signal instead: the stop is
-        // delivered as a group stop at most once more, and the next resume lifts it.
         const int rawStopSig = WSTOPSIG( status );
         const int stopSig = rawStopSig & 0x7f;
         const int resumeSig = ( rawStopSig & 0x80 || stopSig == SIGSTOP || stopSig == SIGTSTP ) ? 0 : stopSig;
@@ -760,7 +893,6 @@ static int RunForked( int argc, char** argv, const char* output )
 
     if( !WIFSTOPPED( status ) )
     {
-        // Child exited or was killed before reaching the post-exec SIGTRAP.
         if( s_shouldQuit )
         {
             fprintf( stderr, "\nInterrupted before target started.\n" );
@@ -780,9 +912,7 @@ static int RunForked( int argc, char** argv, const char* output )
         return 2;
     }
 
-    // The child is stopped post-exec: read its name/exe/maps and check sampling
-    // permissions while we hold it stopped.
-    if( !tracy::InitExternalTarget( childPid ) )
+    if( !tracy::InitExternalTarget( (uint32_t)childPid ) )
     {
         kill( childPid, SIGKILL );
         waitpid( childPid, nullptr, 0 );
@@ -820,8 +950,6 @@ static int RunForked( int argc, char** argv, const char* output )
         return 1;
     }
 
-    // Detach ptrace and let the child run. If detach fails the child stays
-    // stopped forever, so this has to be fatal.
     if( ptrace( PTRACE_DETACH, childPid, nullptr, nullptr ) < 0 )
     {
         fprintf( stderr, "ptrace(DETACH) failed: %s -- killing child.\n", strerror( errno ) );
@@ -833,14 +961,7 @@ static int RunForked( int argc, char** argv, const char* output )
 
     if( !VerifyClientListening() )
     {
-        if( const char* port = getenv( "TRACY_PORT" ) )
-        {
-            fprintf( stderr, "The client could not listen on port %s (the port is most likely in use, or the bind was denied). Retry, or choose another port with --port.\n", port );
-        }
-        else
-        {
-            fprintf( stderr, "The client could not listen on any of the scan ports 8086-8105 (they are most likely all in use, or the bind was denied). Retry, or choose another port with --port.\n" );
-        }
+        fprintf( stderr, "The client could not listen on port %d.\n", EffectivePort() );
         kill( childPid, SIGKILL );
         waitpid( childPid, nullptr, 0 );
         tracy::ShutdownProfiler();
@@ -865,7 +986,6 @@ static int RunForked( int argc, char** argv, const char* output )
         }
     }
 
-    // Wait for child to exit, or for a signal
     for(;;)
     {
         if( s_shouldQuit ) break;
@@ -874,7 +994,6 @@ static int RunForked( int argc, char** argv, const char* output )
         pid_t ret = waitpid( childPid, &wstatus, WNOHANG );
         if( ret > 0 )
         {
-            // the monitor's exit code reflects the monitor, not the profiled application
             if( WIFEXITED( wstatus ) )
             {
                 printf( "Target exited with status %d.\n", WEXITSTATUS( wstatus ) );
@@ -887,11 +1006,10 @@ static int RunForked( int argc, char** argv, const char* output )
         }
         else if( ret < 0 && errno != EINTR )
         {
-            // Child already gone
             break;
         }
         PrintProgress( worker.get() );
-        usleep( 100000 );
+        SleepMs( 100 );
     }
 
     if( ProgressLineActive( worker.get() ) ) printf( "\n" );  // terminate the status line
@@ -900,8 +1018,7 @@ static int RunForked( int argc, char** argv, const char* output )
     {
         printf( "\nForwarding signal to child and shutting down...\n" );
         kill( childPid, SIGINT );
-        // Give it a moment to exit
-        usleep( 500000 );
+        SleepMs( 500 );
         if( ProcessIsAlive( childPid ) )
         {
             kill( childPid, SIGKILL );
@@ -910,7 +1027,6 @@ static int RunForked( int argc, char** argv, const char* output )
     }
     else if( s_shouldQuit )
     {
-        // Child is a zombie (it died since the last poll): reap it.
         waitpid( childPid, nullptr, WNOHANG );
     }
 
@@ -918,6 +1034,283 @@ static int RunForked( int argc, char** argv, const char* output )
     if( worker ) return SaveTrace( *worker, output );
     return 0;
 }
+
+#endif // __linux__
+
+// =============================================================================
+// Windows Implementation
+// =============================================================================
+#ifdef _WIN32
+
+static bool CheckAdminPrivileges()
+{
+    HANDLE hToken = NULL;
+    if( !OpenProcessToken( GetCurrentProcess(), TOKEN_QUERY, &hToken ) ) return false;
+    TOKEN_ELEVATION_TYPE elevationType = TokenElevationTypeDefault;
+    DWORD returnLength = 0;
+    const BOOL ok = GetTokenInformation( hToken, TokenElevationType, &elevationType, sizeof( elevationType ), &returnLength );
+    CloseHandle( hToken );
+    return ok && ( elevationType == TokenElevationTypeFull );
+}
+
+static void PrintStartupReport( const char* output = nullptr )
+{
+    printf( "tracy-monitor %i.%i.%i / %s\n", tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch, tracy::GitRef );
+    printf( "Profiling '%s' (pid %u) on port %d\n", tracy::GetExternalTargetName(), tracy::GetExternalTargetPid(), EffectivePort() );
+    printf( "  sampling:                      %s (ETW kernel profiling)\n", FormatHz( EffectiveSamplingHz() ) );
+    printf( "  ctx switches / per-thread CPU: yes (ETW context switch monitoring)\n" );
+    printf( "  vsync:                         yes (ETW DxgKrnl)\n" );
+#ifdef TRACY_ON_DEMAND
+    printf( "  recording:                     on-demand: samples are captured only while a Tracy server is connected; pre-connection samples are discarded\n" );
+#endif
+    if( output )
+    {
+        printf( "  output:                        %s\n", output );
+    }
+    printf( "\n" );
+    if( !output )
+    {
+        printf( "Open the Tracy profiler and connect to this host:port (or it will auto-discover).\n" );
+    }
+    fflush( stdout );
+}
+static int FindPidsByName( const char* name, uint32_t* outPids, int maxPids )
+{
+    int count = 0;
+    HANDLE snap = CreateToolhelp32Snapshot( TH32CS_SNAPPROCESS, 0 );
+    if( snap == INVALID_HANDLE_VALUE ) return 0;
+
+    PROCESSENTRY32 pe = {};
+    pe.dwSize = sizeof( pe );
+
+    const size_t nameLen = strlen( name );
+    const bool hasExe = nameLen > 4 && ( _stricmp( name + nameLen - 4, ".exe" ) == 0 );
+
+    if( Process32First( snap, &pe ) )
+    {
+        do
+        {
+            bool match = ( _stricmp( pe.szExeFile, name ) == 0 );
+            if( !match && !hasExe )
+            {
+                char withExe[MAX_PATH];
+                snprintf( withExe, sizeof( withExe ), "%s.exe", name );
+                match = ( _stricmp( pe.szExeFile, withExe ) == 0 );
+            }
+            if( match && count < maxPids )
+            {
+                outPids[count++] = pe.th32ProcessID;
+            }
+        } while( Process32Next( snap, &pe ) );
+    }
+    CloseHandle( snap );
+    return count;
+}
+
+static int RunAttached( uint32_t pid, const char* output )
+{
+    if( !ProcessIsAlive( pid ) )
+    {
+        fprintf( stderr, "Process %u does not exist or is not accessible.\n", pid );
+        return 1;
+    }
+
+    if( !CheckAdminPrivileges() )
+    {
+        fprintf( stderr, "Warning: tracy-monitor is not running as Administrator.\n"
+                         "ETW profiling requires Administrator privileges. If profiling fails, please re-run as Administrator.\n\n" );
+    }
+
+    printf( "Attaching to process %u", pid );
+    fflush( stdout );
+
+    if( !tracy::InitExternalTarget( pid ) ) return 1;
+
+    printf( " (%s)...\n", tracy::GetExternalTargetName() );
+    fflush( stdout );
+
+    tracy::StartupProfiler();
+    if( tracy::IsSystemTracingFailed() )
+    {
+        fprintf( stderr, "The client failed to start ETW system tracing (ensure you are running as Administrator).\n" );
+        tracy::ShutdownProfiler();
+        return 1;
+    }
+
+    if( !VerifyClientListening() )
+    {
+        fprintf( stderr, "The client could not listen on port %d.\n", EffectivePort() );
+        tracy::ShutdownProfiler();
+        return 1;
+    }
+
+    PrintStartupReport( output );
+
+    std::unique_ptr<tracy::Worker> worker;
+    if( output )
+    {
+        worker = std::make_unique<tracy::Worker>( "127.0.0.1", (uint16_t)EffectivePort(), -1 );
+        const char* reason = nullptr;
+        if( !WaitForWorker( *worker, &reason ) )
+        {
+            fprintf( stderr, "Cannot capture to %s: %s.\n", output, reason );
+            tracy::RestoreOutputBackup();
+            tracy::ShutdownProfiler();
+            return 1;
+        }
+    }
+
+    while( !s_shouldQuit && ProcessIsAlive( pid ) )
+    {
+        PrintProgress( worker.get() );
+        SleepMs( 100 );
+    }
+
+    if( ProgressLineActive( worker.get() ) ) printf( "\n" );
+
+    if( s_shouldQuit )
+    {
+        printf( "\nShutting down profiler...\n" );
+    }
+    else
+    {
+        printf( "Target exited.\n" );
+    }
+
+    tracy::ShutdownProfiler();
+    if( worker ) return SaveTrace( *worker, output );
+    return 0;
+}
+
+static std::string BuildCommandLine( int argc, char** argv )
+{
+    std::string cmd;
+    for( int i = 0; i < argc; i++ )
+    {
+        if( i > 0 ) cmd += ' ';
+        const char* arg = argv[i];
+        const bool needQuotes = strchr( arg, ' ' ) != nullptr || strchr( arg, '\t' ) != nullptr || *arg == '\0';
+        if( needQuotes ) cmd += '"';
+        for( const char* p = arg; *p; p++ )
+        {
+            if( *p == '"' ) cmd += "\\\"";
+            else if( *p == '\\' && ( *(p + 1) == '"' || *(p + 1) == '\0' ) ) cmd += "\\\\";
+            else cmd += *p;
+        }
+        if( needQuotes ) cmd += '"';
+    }
+    return cmd;
+}
+
+static int RunForked( int argc, char** argv, const char* output )
+{
+    if( !CheckAdminPrivileges() )
+    {
+        fprintf( stderr, "Warning: tracy-monitor is not running as Administrator.\n"
+                         "ETW profiling requires Administrator privileges. If profiling fails, please re-run as Administrator.\n\n" );
+    }
+
+    std::string cmdLine = BuildCommandLine( argc, argv );
+
+    STARTUPINFOA si = {};
+    si.cb = sizeof( si );
+    PROCESS_INFORMATION pi = {};
+
+    std::vector<char> cmdBuf( cmdLine.begin(), cmdLine.end() );
+    cmdBuf.push_back( '\0' );
+
+    if( !CreateProcessA( nullptr, cmdBuf.data(), nullptr, nullptr, TRUE, CREATE_SUSPENDED, nullptr, nullptr, &si, &pi ) )
+    {
+        fprintf( stderr, "Unable to create process '%s': error %lu\n", argv[0], GetLastError() );
+        return 2;
+    }
+
+    s_childProcess = pi.hProcess;
+
+    if( !tracy::InitExternalTarget( pi.dwProcessId ) )
+    {
+        TerminateProcess( pi.hProcess, 1 );
+        CloseHandle( pi.hThread );
+        CloseHandle( pi.hProcess );
+        return 1;
+    }
+
+    printf( "Profiling '%s' (pid %u)...\n", tracy::GetExternalTargetName(), pi.dwProcessId );
+    fflush( stdout );
+
+    tracy::StartupProfiler();
+    if( tracy::IsSystemTracingFailed() )
+    {
+        fprintf( stderr, "The client failed to start ETW system tracing (ensure you are running as Administrator).\n" );
+        TerminateProcess( pi.hProcess, 1 );
+        CloseHandle( pi.hThread );
+        CloseHandle( pi.hProcess );
+        tracy::ShutdownProfiler();
+        return 1;
+    }
+
+    if( !VerifyClientListening() )
+    {
+        fprintf( stderr, "The client could not listen on port %d.\n", EffectivePort() );
+        TerminateProcess( pi.hProcess, 1 );
+        CloseHandle( pi.hThread );
+        CloseHandle( pi.hProcess );
+        tracy::ShutdownProfiler();
+        return 1;
+    }
+
+    ResumeThread( pi.hThread );
+    CloseHandle( pi.hThread );
+
+    PrintStartupReport( output );
+
+    std::unique_ptr<tracy::Worker> worker;
+    if( output )
+    {
+        worker = std::make_unique<tracy::Worker>( "127.0.0.1", (uint16_t)EffectivePort(), -1 );
+        const char* reason = nullptr;
+        if( !WaitForWorker( *worker, &reason ) )
+        {
+            fprintf( stderr, "Cannot capture to %s: %s.\n", output, reason );
+            tracy::RestoreOutputBackup();
+            TerminateProcess( pi.hProcess, 1 );
+            CloseHandle( pi.hProcess );
+            tracy::ShutdownProfiler();
+            return 1;
+        }
+    }
+
+    for(;;)
+    {
+        if( s_shouldQuit ) break;
+        PrintProgress( worker.get() );
+        const DWORD res = WaitForSingleObject( pi.hProcess, 100 );
+        if( res == WAIT_OBJECT_0 )
+        {
+            DWORD exitCode = 0;
+            GetExitCodeProcess( pi.hProcess, &exitCode );
+            printf( "Target exited with status %lu.\n", exitCode );
+            break;
+        }
+    }
+
+    if( ProgressLineActive( worker.get() ) ) printf( "\n" );
+
+    if( s_shouldQuit && ProcessIsAlive( pi.dwProcessId ) )
+    {
+        printf( "\nStopping target and shutting down...\n" );
+        TerminateProcess( pi.hProcess, 1 );
+        WaitForSingleObject( pi.hProcess, 1000 );
+    }
+
+    CloseHandle( pi.hProcess );
+    s_childProcess = NULL;
+    tracy::ShutdownProfiler();
+    if( worker ) return SaveTrace( *worker, output );
+    return 0;
+}
+
+#endif // _WIN32
 
 // --- CLI --------------------------------------------------------------------
 
@@ -932,23 +1325,27 @@ static void PrintUsage( const char* progName )
     printf( "\n" );
     printf( "Options:\n" );
     printf( "  -p, --pid PID      Attach to an existing process (PID)\n" );
-    printf( "  -n, --name NAME    Attach to an existing process by name; the name is the\n" );
-    printf( "                     /proc/<pid>/comm value, truncated to 15 characters. If\n" );
-    printf( "                     several processes match, their PIDs are listed; use -p.\n" );
-    printf( "  --hz N             Sampling frequency in Hz (default 10000, range 1..1000000)\n" );
+    printf( "  -n, --name NAME    Attach to an existing process by name; if several processes\n" );
+    printf( "                     match, their PIDs are listed; use -p.\n" );
+    printf( "  --hz N             Sampling frequency in Hz (default %d, range 1..1000000)\n", EffectiveSamplingHz() );
     printf( "  --port N           Listen port for Tracy servers (default 8086)\n" );
     printf( "  -o, --output FILE  Save the trace to FILE (.tracy) when the capture\n" );
     printf( "                     ends. While capturing, the monitor acts as the Tracy\n" );
     printf( "                     server itself, so the profiler GUI cannot connect\n" );
-    printf( "  -f, --force        Replace the output file if it exist\n" );
+    printf( "  -f, --force        Replace the output file if it exists\n" );
     printf( "  -h, --help         Show this help message\n" );
     printf( "\n" );
     printf( "Exit codes: 0 on success; 1 when the target cannot be profiled\n" );
     printf( "(bad option, no matching process, permission or kernel refusal) or\n" );
     printf( "the trace cannot be saved; 2 when the monitor itself fails to start the\n" );
-    printf( "target (fork/exec/ptrace); 4 when the output file already exists\n" );
-    printf( "(use -f to overwrite); 5 when the output file cannot be opened or used.\n" );
+    printf( "target; 4 when the output file already exists (use -f to overwrite);\n" );
+    printf( "5 when the output file cannot be opened or used.\n" );
     printf( "\n" );
+#ifdef _WIN32
+    printf( "Permission requirements:\n" );
+    printf( "  ETW kernel sampling and context switch monitoring require running\n" );
+    printf( "  tracy-monitor as Administrator.\n" );
+#else
     printf( "Permission requirements (perf_event_paranoid / capabilities):\n" );
     printf( "  sampling + symbolication               ptrace READ access to the target:\n" );
     printf( "                                         same user (uid and gid) and dumpable,\n" );
@@ -965,84 +1362,16 @@ static void PrintUsage( const char* progName )
     printf( "                                         CAP_PERFMON for the event open\n" );
     printf( "  power (RAPL) plot                      read access to\n" );
     printf( "                                         /sys/devices/virtual/powercap/intel-rapl\n" );
+#endif
     printf( "\n" );
     printf( "Examples:\n" );
     printf( "  %s ./my_program arg1 arg2\n", progName );
     printf( "  %s -o trace.tracy -n my_program\n", progName );
     printf( "\n" );
-    printf( "In launch mode the target is started under ptrace control so profiling\n" );
-    printf( "begins before its first instruction; quitting the monitor terminates the\n" );
-    printf( "target. In attach mode (-p/-n) the target must already be running and is\n" );
-    printf( "left running when the monitor quits.\n" );
-}
-// Reserve the first free port in the client's 8086..8105 scan range and hand the
-// probe socket to the client (SetReservedListenSocket) so the reservation is atomic.
-// The probe must mirror the client's bind exactly (ListenSocket::Listen): IPv6
-// dual-stack first, IPv4 only if socket() itself fails, SO_REUSEADDR,
-// TRACY_ONLY_LOCALHOST narrows to loopback, fd CLOEXEC (no leak into the target).
-static bool ProbeClientBind( int port, bool ipv4Only, bool onlyLocalhost, int& fdOut )
-{
-    fdOut = -1;
-    int s = -1;
-    int family = AF_INET6;
-    if( !ipv4Only ) s = socket( AF_INET6, SOCK_STREAM, 0 );
-    if( s < 0 )
-    {
-        family = AF_INET;
-        s = socket( AF_INET, SOCK_STREAM, 0 );
-    }
-    if( s < 0 ) return false;
-    fcntl( s, F_SETFD, FD_CLOEXEC );
-    int val = 1;
-    setsockopt( s, SOL_SOCKET, SO_REUSEADDR, &val, sizeof( val ) );
-    bool ok = false;
-    if( family == AF_INET6 )
-    {
-        sockaddr_in6 addr = {};
-        addr.sin6_family = AF_INET6;
-        if( onlyLocalhost ) addr.sin6_addr = in6addr_loopback;
-        addr.sin6_port = htons( (uint16_t)port );
-        ok = bind( s, (sockaddr*)&addr, sizeof( addr ) ) == 0 && listen( s, 4 ) == 0;
-    }
-    else
-    {
-        sockaddr_in addr = {};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = onlyLocalhost ? htonl( INADDR_LOOPBACK ) : INADDR_ANY;
-        addr.sin_port = htons( (uint16_t)port );
-        ok = bind( s, (sockaddr*)&addr, sizeof( addr ) ) == 0 && listen( s, 4 ) == 0;
-    }
-    if( ok )
-    {
-        fdOut = s;
-    }
-    else
-    {
-        close( s );
-    }
-    return ok;
-}
-
-static void ReservePortIfUnpinned()
-{
-    if( getenv( "TRACY_PORT" ) ) return;
-    const char* onlyIPv4 = getenv( "TRACY_ONLY_IPV4" );
-    const char* onlyLocalhost = getenv( "TRACY_ONLY_LOCALHOST" );
-    const bool ipv4Only = onlyIPv4 && onlyIPv4[0] == '1';
-    const bool localhost = onlyLocalhost && onlyLocalhost[0] == '1';
-    for( int i=0; i<20; i++ )
-    {
-        const int port = 8086 + i;
-        int fd = -1;
-        if( ProbeClientBind( port, ipv4Only, localhost, fd ) )
-        {
-            char buf[8];
-            snprintf( buf, sizeof( buf ), "%d", port );
-            setenv( "TRACY_PORT", buf, 1 );
-            tracy::SetReservedListenSocket( fd );
-            return;
-        }
-    }
+    printf( "In launch mode the target is started controlled so profiling begins before\n" );
+    printf( "its first instruction; quitting the monitor terminates the target. In attach\n" );
+    printf( "mode (-p/-n) the target must already be running and is left running when\n" );
+    printf( "the monitor quits.\n" );
 }
 
 int main( int argc, char** argv )
@@ -1056,7 +1385,9 @@ int main( int argc, char** argv )
         return 1;
     }
 
-    // Install signal handlers for graceful shutdown
+#ifdef _WIN32
+    SetConsoleCtrlHandler( ConsoleCtrlHandler, TRUE );
+#else
     struct sigaction sa = {};
     sa.sa_handler = SignalHandler;
     sigemptyset( &sa.sa_mask );
@@ -1065,23 +1396,6 @@ int main( int argc, char** argv )
     sigaction( SIGTERM, &sa, nullptr );
     sigaction( SIGHUP, &sa, nullptr );
     sigaction( SIGQUIT, &sa, nullptr );
-
-    // TRACY_NO_SYS_TRACE / TRACY_NO_SAMPLING would silently disable the monitor's
-    // primary data sources (IsSystemTracingFailed() stays false); refuse them up front.
-    const char* noSysTrace = getenv( "TRACY_NO_SYS_TRACE" );
-    const char* noSampling = getenv( "TRACY_NO_SAMPLING" );
-    if( ( noSysTrace && noSysTrace[0] == '1' ) || ( noSampling && noSampling[0] == '1' ) )
-    {
-        if( noSysTrace && noSysTrace[0] == '1' )
-        {
-            fprintf( stderr, "tracy-monitor: TRACY_NO_SYS_TRACE=1 is set; the monitor requires system tracing. Unset the variable and retry.\n" );
-        }
-        if( noSampling && noSampling[0] == '1' )
-        {
-            fprintf( stderr, "tracy-monitor: TRACY_NO_SAMPLING=1 is set; the monitor requires callstack sampling. Unset the variable and retry.\n" );
-        }
-        return 1;
-    }
 
     // external sampling opens one event per CPU for each existing thread
     // (attach) or per CPU (launch) per event type; raise the soft fd limit
@@ -1101,17 +1415,37 @@ int main( int argc, char** argv )
             }
         }
     }
+#endif
 
-    pid_t attachPid = 0;
+    // TRACY_NO_SYS_TRACE / TRACY_NO_SAMPLING would silently disable the monitor's
+    // primary data sources (IsSystemTracingFailed() stays false); refuse them up front.
+    const char* noSysTrace = getenv( "TRACY_NO_SYS_TRACE" );
+    const char* noSampling = getenv( "TRACY_NO_SAMPLING" );
+    if( ( noSysTrace && noSysTrace[0] == '1' ) || ( noSampling && noSampling[0] == '1' ) )
+    {
+        if( noSysTrace && noSysTrace[0] == '1' )
+        {
+            fprintf( stderr, "tracy-monitor: TRACY_NO_SYS_TRACE=1 is set; the monitor requires system tracing. Unset the variable and retry.\n" );
+        }
+        if( noSampling && noSampling[0] == '1' )
+        {
+            fprintf( stderr, "tracy-monitor: TRACY_NO_SAMPLING=1 is set; the monitor requires callstack sampling. Unset the variable and retry.\n" );
+        }
+        return 1;
+    }
+
+    uint32_t attachPid = 0;
     char attachName[128] = {};
     bool wantAttach = false;
     const char* output = nullptr;
     bool overwrite = false;
 
-    enum { OptHz = 256, OptPort };
-
-    static struct option longOptions[] =
+    enum LongOption
     {
+        OptHz = 256,
+        OptPort,
+    };
+    static const struct option longOptions[] = {
         { "pid",    required_argument, nullptr, 'p' },
         { "name",   required_argument, nullptr, 'n' },
         { "hz",     required_argument, nullptr, OptHz },
@@ -1128,7 +1462,7 @@ int main( int argc, char** argv )
         switch( c )
         {
         case 'p':
-            attachPid = atoi( optarg );
+            attachPid = (uint32_t)atoi( optarg );
             wantAttach = true;
             break;
         case 'n':
@@ -1150,7 +1484,7 @@ int main( int argc, char** argv )
             }
             char buf[16];
             snprintf( buf, sizeof( buf ), "%d", hz );
-            setenv( "TRACY_SAMPLING_HZ", buf, 1 );
+            SetEnv( "TRACY_SAMPLING_HZ", buf );
             break;
         }
         case OptPort:
@@ -1163,7 +1497,7 @@ int main( int argc, char** argv )
             }
             char buf[8];
             snprintf( buf, sizeof( buf ), "%d", port );
-            setenv( "TRACY_PORT", buf, 1 );
+            SetEnv( "TRACY_PORT", buf );
             break;
         }
         case 'o':
@@ -1196,6 +1530,7 @@ int main( int argc, char** argv )
             }
         }
     }
+
     ReservePortIfUnpinned();
 
     if( output )
@@ -1213,29 +1548,33 @@ int main( int argc, char** argv )
             return 5;
         }
     }
-
     if( wantAttach )
     {
         if( attachName[0] )
         {
+#ifdef _WIN32
+            uint32_t pids[32] = {};
+            const int numPids = FindPidsByName( attachName, pids, 32 );
+#else
             pid_t pids[32] = {};
             const int numPids = FindPidsByComm( attachName, pids, 32 );
+#endif
             if( numPids == 0 )
             {
-                fprintf( stderr, "No process named '%s' (names are /proc/<pid>/comm values, truncated to 15 characters).\n", attachName );
+                fprintf( stderr, "No process named '%s'.\n", attachName );
                 return 1;
             }
             if( numPids > 1 )
             {
                 fprintf( stderr, "Several processes named '%s':", attachName );
-                for( int i=0; i<numPids; i++ ) fprintf( stderr, " %d", (int)pids[i] );
+                for( int i=0; i<numPids; i++ ) fprintf( stderr, " %u", (uint32_t)pids[i] );
                 fprintf( stderr, "\nUse -p PID to disambiguate.\n" );
                 return 1;
             }
             return RunAttached( pids[0], output );
         }
 
-        if( attachPid <= 0 )
+        if( attachPid == 0 )
         {
             fprintf( stderr, "Invalid PID specified.\n" );
             return 1;
@@ -1248,7 +1587,7 @@ int main( int argc, char** argv )
 
     if( argc < 1 )
     {
-        PrintUsage( progName );  // argv[0] was shifted, use original
+        PrintUsage( progName );
         return 1;
     }
 
