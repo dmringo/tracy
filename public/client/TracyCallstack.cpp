@@ -978,7 +978,12 @@ void DbgHelpInit()
     if( SetEnvironmentVariableA( "_NT_SYMBOL_PATH", buffer ) == FALSE ) SymError( "SetEnvironmentVariableA", GetLastError() );
  
     SymSetOptions( SymGetOptions() | SYMOPT_LOAD_LINES );
-    if( SymInitialize( GetDbgHelpProcess(), NULL, TRUE ) == FALSE )
+#ifdef TRACY_HAS_EXTERNAL_TARGET
+    const BOOL invProcess = ( s_externalTargetProcess != NULL ) ? FALSE : TRUE;
+#else
+    const BOOL invProcess = TRUE;
+#endif
+    if( SymInitialize( GetDbgHelpProcess(), NULL, invProcess ) == FALSE )
     {
         SymError( "SymInitialize", GetLastError() );
     }
