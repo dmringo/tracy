@@ -268,6 +268,13 @@ static bool ProbeClientBind( int port, bool ipv4Only, bool onlyLocalhost, int& f
     bool ok = false;
     if( family == AF_INET6 )
     {
+#ifdef _WIN32
+        unsigned long v6only = 0;
+        setsockopt( s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&v6only, sizeof( v6only ) );
+#elif defined __APPLE__ || defined __FreeBSD__ || defined __NetBSD__ || defined __OpenBSD__ || defined __DragonFly__
+        int v6only = 0;
+        setsockopt( s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&v6only, sizeof( v6only ) );
+#endif
         sockaddr_in6 addr = {};
         addr.sin6_family = AF_INET6;
         if( onlyLocalhost ) addr.sin6_addr = in6addr_loopback;
