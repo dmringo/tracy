@@ -186,3 +186,22 @@ flowchart TD
   - Non-existent PID: `./monitor/build/tracy-monitor.exe -p 999999` $\to$ correctly reports `Process 999999 does not exist or is not accessible.`
   - Non-existent Name: `./monitor/build/tracy-monitor.exe -n non_existent_process_123` $\to$ correctly reports `No process named 'non_existent_process_123'.`
   - Name Match: Ran `test_workload.exe` in background and attached via `tracy-monitor.exe -n test_workload` $\to$ successfully matched PID, opened target, extracted name, and initialized profiler.
+- [x] **End-to-End Trace Capture & Symbol Verification**:
+  - **Dual-Stack Binding**: Fixed probe socket bind in `monitor/src/monitor.cpp` to explicitly set `IPV6_V6ONLY = 0`, matching `TracySocket.cpp` so Windows dual-stack sockets accept connections from `127.0.0.1`.
+  - **Live Capture**: Executed `tracy-monitor.exe` profiling `test_workload.exe` and connected `tracy-capture.exe -a 127.0.0.1 -p 8086 -o test_trace.tracy -s 4`.
+  - **Trace Results**:
+    - Output trace size: 5.4 MB (compressed with Zstandard).
+    - Total samples recorded: **13,101 callstack samples** at 8 kHz.
+    - Total callstack frames captured: **429,390 frames**.
+    - Total resolved symbols: **1,356 symbols**.
+    - Verified user function resolution with exact PDB mapping:
+      - `WorkerFunction (C:\Users\david\repos\tracy\monitor\build\test_workload.cpp:19)`
+      - `WorkerFunction (C:\Users\david\repos\tracy\monitor\build\test_workload.cpp:22)`
+      - `BusyWork (C:\Users\david\repos\tracy\monitor\build\test_workload.cpp:8)`
+      - `BusyWork (C:\Users\david\repos\tracy\monitor\build\test_workload.cpp:10)`
+      - `BusyWork (C:\Users\david\repos\tracy\monitor\build\test_workload.cpp:12)`
+      - `main (C:\Users\david\repos\tracy\monitor\build\test_workload.cpp:27)`
+      - CRT & system frames: `__scrt_common_main_seh`, `sin`, `cos`, `RtlAllocateHeap`.
+  - **Server & GUI Verification**:
+    - `capture/build/tracy-capture.exe` successfully captured and wrote the `.tracy` trace file.
+    - `profiler/build/tracy-profiler.exe` built and successfully opened and loaded the captured trace into the GUI.
