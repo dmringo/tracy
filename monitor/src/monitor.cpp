@@ -1340,6 +1340,7 @@ static void PrintUsage( const char* progName )
     printf( "                     ends. While capturing, the monitor acts as the Tracy\n" );
     printf( "                     server itself, so the profiler GUI cannot connect\n" );
     printf( "  -f, --force        Replace the output file if it exists\n" );
+    printf( "  -u, --user-only    Filter out kernel callstack frames (user-space only)\n" );
     printf( "  -h, --help         Show this help message\n" );
     printf( "\n" );
     printf( "Exit codes: 0 on success; 1 when the target cannot be profiled\n" );
@@ -1453,18 +1454,19 @@ int main( int argc, char** argv )
         OptPort,
     };
     static const struct option longOptions[] = {
-        { "pid",    required_argument, nullptr, 'p' },
-        { "name",   required_argument, nullptr, 'n' },
-        { "hz",     required_argument, nullptr, OptHz },
-        { "port",   required_argument, nullptr, OptPort },
-        { "output", required_argument, nullptr, 'o' },
-        { "force",  no_argument,       nullptr, 'f' },
-        { "help",   no_argument,       nullptr, 'h' },
+        { "pid",       required_argument, nullptr, 'p' },
+        { "name",      required_argument, nullptr, 'n' },
+        { "hz",        required_argument, nullptr, OptHz },
+        { "port",      required_argument, nullptr, OptPort },
+        { "output",    required_argument, nullptr, 'o' },
+        { "force",     no_argument,       nullptr, 'f' },
+        { "user-only", no_argument,       nullptr, 'u' },
+        { "help",      no_argument,       nullptr, 'h' },
         { nullptr, 0, nullptr, 0 }
     };
 
     int c;
-    while( ( c = getopt_long( argc, argv, "+p:n:o:fh", longOptions, nullptr ) ) != -1 )
+    while( ( c = getopt_long( argc, argv, "+p:n:o:fhu", longOptions, nullptr ) ) != -1 )
     {
         switch( c )
         {
@@ -1507,6 +1509,9 @@ int main( int argc, char** argv )
             SetEnv( "TRACY_PORT", buf );
             break;
         }
+        case 'u':
+            SetEnv( "TRACY_USER_ONLY_SAMPLES", "1" );
+            break;
         case 'o':
             output = optarg;
             break;
@@ -1518,6 +1523,7 @@ int main( int argc, char** argv )
             return 0;
         case '?':
             fprintf( stderr, "Unknown option. Use -h for help.\n" );
+            return 1;
             return 1;
         }
     }
