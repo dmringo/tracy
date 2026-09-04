@@ -81,6 +81,7 @@ t_GetModuleInformation _GetModuleInformation = (t_GetModuleInformation)GetProcAd
 t_GetModuleBaseNameA _GetModuleBaseNameA = (t_GetModuleBaseNameA)GetProcAddress( GetModuleHandleA( "kernel32.dll" ), "K32GetModuleBaseNameA" );
 
 static t_GetThreadDescription _GetThreadDescription = 0;
+static bool s_userOnlySamples = false;
 
 
 void WINAPI EventRecordCallback( PEVENT_RECORD record )
@@ -144,12 +145,21 @@ void WINAPI EventRecordCallback( PEVENT_RECORD record )
             const auto sw = (const etw::StackWalkEvent*)record->UserData;
             if( sw->stackProcess == s_pid )
             {
-                const uint64_t sz = ( record->UserDataLength - 16 ) / 8;
+                uint64_t sz = ( record->UserDataLength - 16 ) / 8;
+                const uint64_t* stack = sw->stack;
+                if( s_userOnlySamples )
+                {
+                    while( sz > 0 && ( (int64_t)*stack < 0 ) )
+                    {
+                        stack++;
+                        sz--;
+                    }
+                }
                 if( sz > 0 )
                 {
                     auto trace = (uint64_t*)tracy_malloc( ( 1 + sz ) * sizeof( uint64_t ) );
                     memcpy( trace, &sz, sizeof( uint64_t ) );
-                    memcpy( trace+1, sw->stack, sizeof( uint64_t ) * sz );
+                    memcpy( trace+1, stack, sizeof( uint64_t ) * sz );
                     TracyLfqPrepare( QueueType::CallstackSample );
                     MemWrite( &item->callstackSampleFat.time, int64_t( sw->eventTimeStamp ) );
                     MemWrite( &item->callstackSampleFat.thread, sw->stackThread );
@@ -210,6 +220,10 @@ bool SysTraceStart( int64_t& samplingPeriod )
         return etw::StopSession( session_kernel ), false;
 #endif
 
+
+    const char* userOnlyEnv = GetEnvVar( "TRACY_USER_ONLY_SAMPLES" );
+    if( !userOnlyEnv ) userOnlyEnv = GetEnvVar( "TRACY_NO_KERNEL_SAMPLES" );
+    s_userOnlySamples = userOnlyEnv && userOnlyEnv[0] == '1';
 
 #ifndef TRACY_NO_SAMPLING
     samplingPeriod = SamplingFrequencyToPeriodNs( GetSamplingFrequency() );

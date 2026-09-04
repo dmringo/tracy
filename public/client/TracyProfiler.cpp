@@ -1877,7 +1877,13 @@ void Profiler::Worker()
     flags |= WelcomeFlag::CodeTransfer;
 #endif
 #ifdef _WIN32
-    flags |= WelcomeFlag::CombineSamples;
+    const char* userOnlyEnv = GetEnvVar( "TRACY_USER_ONLY_SAMPLES" );
+    if( !userOnlyEnv ) userOnlyEnv = GetEnvVar( "TRACY_NO_KERNEL_SAMPLES" );
+    const bool userOnly = userOnlyEnv && userOnlyEnv[0] == '1';
+    if( !userOnly )
+    {
+        flags |= WelcomeFlag::CombineSamples;
+    }
 #  ifndef TRACY_NO_CONTEXT_SWITCH
     flags |= WelcomeFlag::IdentifySamples;
 #  endif
