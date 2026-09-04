@@ -562,6 +562,7 @@ public:
     uint64_t GetHwSampleCountAddress() const { return m_data.hwSamples.size(); }
     uint64_t GetHwSampleCount() const;
     bool HasHwBranchRetirement() const { return m_data.hasBranchRetirement; }
+    bool IsUserOnlySamples() const { return m_userOnlySamples; }
 #ifndef TRACY_NO_STATISTICS
     uint64_t GetChildSamplesCountSyms() const { return m_data.childSamples.size(); }
     uint64_t GetChildSamplesCountFull() const;
@@ -1015,6 +1016,7 @@ private:
     tracy_force_inline void AddCallstackAllocPayload( const char* data );
     uint32_t MergeCallstacks( uint32_t first, uint32_t second );
 
+    uint32_t GetCallstackUserSlice( uint32_t callstack );
     void InsertPlot( PlotData* plot, int64_t time, double val );
     void HandlePlotName( uint64_t name, const char* str, size_t sz );
     void HandleFrameName( uint64_t name, const char* str, size_t sz );
@@ -1131,6 +1133,7 @@ private:
     bool m_identifySamples = false;
     bool m_inconsistentSamples;
     std::atomic<int64_t> m_excessiveZoneDepthTime { -1 };
+    bool m_userOnlySamples = false;
     bool m_allowStringModification = false;
 
     short_ptr<GpuCtxData> m_gpuCtxMap[256];

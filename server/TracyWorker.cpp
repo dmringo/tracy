@@ -98,6 +98,13 @@ static bool IsQueryPrio( ServerQuery type )
 {
     return type < ServerQuery::ServerQueryDisconnect;
 }
+static bool CheckUserOnlySamplesEnv()
+{
+    const char* userOnlyEnv = getenv( "TRACY_USER_ONLY_SAMPLES" );
+    if( !userOnlyEnv ) userOnlyEnv = getenv( "TRACY_NO_KERNEL_SAMPLES" );
+    return userOnlyEnv && userOnlyEnv[0] == '1';
+}
+
 
 
 LoadProgress Worker::s_loadProgress;
@@ -109,6 +116,7 @@ Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit )
     , m_stream( LZ4_createStreamDecode() )
     , m_buffer( new char[TargetFrameSize*3 + 1] )
     , m_bufferOffset( 0 )
+    , m_userOnlySamples( CheckUserOnlySamplesEnv() )
     , m_inconsistentSamples( false )
     , m_memoryLimit( memoryLimit )
     , m_callstackFrameStaging( nullptr )
@@ -151,6 +159,7 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
     , m_buffer( nullptr )
     , m_onDemand( false )
     , m_inconsistentSamples( false )
+    , m_userOnlySamples( CheckUserOnlySamplesEnv() )
     , m_memoryLimit( -1 )
     , m_traceVersion( CurrentVersion )
 {
@@ -396,6 +405,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     , m_stream( nullptr )
     , m_buffer( nullptr )
     , m_inconsistentSamples( false )
+    , m_userOnlySamples( CheckUserOnlySamplesEnv() )
     , m_memoryLimit( -1 )
     , m_allowStringModification( allowStringModification )
 {
@@ -1828,7 +1838,16 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                             const auto& time = v.time;
                             const auto cs = v.callstack.Val();
                             const auto& callstack = GetCallstack( cs );
-                            auto& ip = callstack[0];
+                            uint16_t userIdx = 0;
+                            if( m_userOnlySamples )
+                            {
+                                while( userIdx < callstack.size() && ( GetCanonicalPointer( callstack[userIdx] ) >> 63 != 0 ) )
+                                {
+                                    userIdx++;
+                                }
+                                if( userIdx >= callstack.size() ) continue;
+                            }
+                            auto& ip = callstack[userIdx];
                             auto frame = GetCallstackFrame( ip );
                             if( frame )
                             {
@@ -1843,8 +1862,8 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                                     it->second.push_back_non_empty( SampleDataRange { time, tid, ip } );
                                 }
                             }
-                            auto childAddr = GetCanonicalPointer( callstack[0] );
-                            for( uint16_t i=1; i<callstack.size(); i++ )
+                            auto childAddr = GetCanonicalPointer( callstack[userIdx] );
+                            for( uint16_t i=userIdx+1; i<callstack.size(); i++ )
                             {
                                 auto addr = GetCanonicalPointer( callstack[i] );
                                 auto it = m_data.childSamples.find( addr );
@@ -4198,6 +4217,41 @@ uint32_t Worker::MergeCallstacks( uint32_t first, uint32_t second )
     }
     return idx;
 }
+uint32_t Worker::GetCallstackUserSlice( uint32_t callstack )
+{
+    const auto& cs = GetCallstack( callstack );
+    uint16_t userIdx = 0;
+    while( userIdx < cs.size() && ( GetCanonicalPointer( cs[userIdx] ) >> 63 != 0 ) )
+    {
+        userIdx++;
+    }
+    if( userIdx == 0 ) return callstack;
+    if( userIdx >= cs.size() ) return 0;
+
+    const uint16_t sz = cs.size() - userIdx;
+    size_t memsize = sizeof( VarArray<CallstackFrameId> ) + sz * sizeof( CallstackFrameId );
+    auto mem = (char*)m_slab.AllocRaw( memsize );
+    memcpy( mem, cs.data() + userIdx, sizeof( CallstackFrameId ) * sz );
+
+    auto arr = (VarArray<CallstackFrameId>*)( mem + sz * sizeof( CallstackFrameId ) );
+    new(arr) VarArray<CallstackFrameId>( sz, (CallstackFrameId*)mem );
+
+    uint32_t idx;
+    auto it = m_data.callstackMap.find( arr );
+    if( it == m_data.callstackMap.end() )
+    {
+        idx = uint32_t( m_data.callstackPayload.size() );
+        m_data.callstackMap.emplace( arr, idx );
+        m_data.callstackPayload.push_back( arr );
+    }
+    else
+    {
+        idx = it->second;
+        m_slab.Unalloc( memsize );
+    }
+    return idx;
+}
+
 
 void Worker::InsertPlot( PlotData* plot, int64_t time, double val )
 {
@@ -6659,21 +6713,57 @@ void Worker::ProcessCallstackSample( const QueueCallstackSample& ev )
         {
             if( pendingTime == t )
             {
-                const auto mcs = MergeCallstacks( td.pendingSample.callstack.Val(), callstack );
-                sd.callstack.SetVal( mcs );
-                ProcessCallstackSampleImpl( sd, td );
+                if( m_userOnlySamples )
+                {
+                    const auto userCs = GetCallstackUserSlice( callstack );
+                    if( userCs != 0 )
+                    {
+                        sd.callstack.SetVal( userCs );
+                        ProcessCallstackSampleImpl( sd, td );
+                    }
+                }
+                else
+                {
+                    const auto mcs = MergeCallstacks( td.pendingSample.callstack.Val(), callstack );
+                    sd.callstack.SetVal( mcs );
+                    ProcessCallstackSampleImpl( sd, td );
+                }
                 td.pendingSample.time.Clear();
             }
             else
             {
-                ProcessCallstackSampleImpl( td.pendingSample, td );
+                if( m_userOnlySamples )
+                {
+                    const auto userCs = GetCallstackUserSlice( td.pendingSample.callstack.Val() );
+                    if( userCs != 0 )
+                    {
+                        td.pendingSample.callstack.SetVal( userCs );
+                        ProcessCallstackSampleImpl( td.pendingSample, td );
+                    }
+                }
+                else
+                {
+                    ProcessCallstackSampleImpl( td.pendingSample, td );
+                }
                 td.pendingSample = sd;
             }
         }
     }
     else
     {
-        ProcessCallstackSampleImpl( sd, td );
+        if( m_userOnlySamples )
+        {
+            const auto userCs = GetCallstackUserSlice( callstack );
+            if( userCs != 0 )
+            {
+                sd.callstack.SetVal( userCs );
+                ProcessCallstackSampleImpl( sd, td );
+            }
+        }
+        else
+        {
+            ProcessCallstackSampleImpl( sd, td );
+        }
     }
 }
 
@@ -7745,10 +7835,20 @@ void Worker::UpdateSampleStatisticsPostponed( decltype(Worker::DataBlock::postpo
 
 void Worker::UpdateSampleStatisticsImpl( const CallstackFrameData** frames, uint16_t framesCount, uint32_t count, const VarArray<CallstackFrameId>& cs )
 {
+    uint16_t userIdx = 0;
+    if( m_userOnlySamples )
+    {
+        while( userIdx < framesCount && ( frames[userIdx]->data[0].symAddr >> 63 != 0 ) )
+        {
+            userIdx++;
+        }
+        if( userIdx >= framesCount ) return;
+    }
+
     thread_local unordered_flat_set<uint64_t> seen;
     seen.clear();
 
-    const auto fexcl = frames[0];
+    const auto fexcl = frames[userIdx];
     const auto fxsz = fexcl->size;
     const auto& frame0 = fexcl->data[0];
     auto sym0 = m_data.symbolStats.find( frame0.symAddr );
@@ -7764,7 +7864,7 @@ void Worker::UpdateSampleStatisticsImpl( const CallstackFrameData** frames, uint
         if( sym == m_data.symbolStats.end() ) sym = m_data.symbolStats.emplace( frame.symAddr, SymbolStats { 0, 0 } ).first;
         sym->second.incl += count;
     }
-    for( uint16_t c=1; c<framesCount; c++ )
+    for( uint16_t c=userIdx+1; c<framesCount; c++ )
     {
         const auto fincl = frames[c];
         const auto fsz = fincl->size;
@@ -7797,7 +7897,7 @@ void Worker::UpdateSampleStatisticsImpl( const CallstackFrameData** frames, uint
     // iteration order.
     seen.clear();
     auto suffixIdx = InternSyntheticCallstack( nullptr, cs, framesCount );
-    for( int32_t c=framesCount-1; c>=0; c-- )
+    for( int32_t c=framesCount-1; c>=userIdx; c-- )
     {
         const auto fdat = frames[c];
         const auto fsz = fdat->size;
@@ -7826,13 +7926,13 @@ void Worker::UpdateSampleStatisticsImpl( const CallstackFrameData** frames, uint
             assert( sym != m_data.symbolStats.end() );
             UpdateEntry( sym->second.wasReached, idx, count );
             if( seen.emplace( symAddr ).second ) UpdateEntry( sym->second.wasReachedNonReentrant, idx, count );
-            if( c == 0 && f == 0 )
+            if( c == userIdx && f == 0 )
             {
                 UpdateEntry( sym->second.wasExecuting, idx, count );
                 UpdateEntry( sym->second.wasExecutingBase, suffixIdx, count );
             }
         }
-        if( c > 0 ) suffixIdx = InternSyntheticCallstack( nullptr, cs, c );
+        if( c > userIdx ) suffixIdx = InternSyntheticCallstack( nullptr, cs, c );
     }
 }
 
