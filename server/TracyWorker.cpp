@@ -1637,6 +1637,30 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
 
     s_loadProgress.total.store( 0, std::memory_order_relaxed );
     m_loadTime = std::chrono::duration_cast<std::chrono::nanoseconds>( std::chrono::high_resolution_clock::now() - loadStart ).count();
+    if( m_userOnlySamples )
+    {
+        uint64_t totalCnt = 0;
+        for( auto& t : m_data.threads )
+        {
+            auto it = t->samples.begin();
+            while( it != t->samples.end() )
+            {
+                const auto userCs = GetCallstackUserSlice( it->callstack.Val() );
+                if( userCs == 0 )
+                {
+                    it = t->samples.erase( it );
+                }
+                else
+                {
+                    it->callstack.SetVal( userCs );
+                    it++;
+                }
+            }
+            t->kernelSampleCnt = 0;
+            totalCnt += t->samples.size();
+        }
+        m_data.samplesCnt = totalCnt;
+    }
 
     if( !bgTasks )
     {
@@ -1838,16 +1862,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                             const auto& time = v.time;
                             const auto cs = v.callstack.Val();
                             const auto& callstack = GetCallstack( cs );
-                            uint16_t userIdx = 0;
-                            if( m_userOnlySamples )
-                            {
-                                while( userIdx < callstack.size() && ( GetCanonicalPointer( callstack[userIdx] ) >> 63 != 0 ) )
-                                {
-                                    userIdx++;
-                                }
-                                if( userIdx >= callstack.size() ) continue;
-                            }
-                            auto& ip = callstack[userIdx];
+                            auto& ip = callstack[0];
                             auto frame = GetCallstackFrame( ip );
                             if( frame )
                             {
@@ -1862,8 +1877,8 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                                     it->second.push_back_non_empty( SampleDataRange { time, tid, ip } );
                                 }
                             }
-                            auto childAddr = GetCanonicalPointer( callstack[userIdx] );
-                            for( uint16_t i=userIdx+1; i<callstack.size(); i++ )
+                            auto childAddr = GetCanonicalPointer( callstack[0] );
+                            for( uint16_t i=1; i<callstack.size(); i++ )
                             {
                                 auto addr = GetCanonicalPointer( callstack[i] );
                                 auto it = m_data.childSamples.find( addr );

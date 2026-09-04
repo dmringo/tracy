@@ -1217,6 +1217,7 @@ static int RunForked( int argc, char** argv, const char* output )
                          "ETW profiling requires Administrator privileges. If profiling fails, please re-run as Administrator.\n\n" );
     }
 
+
     std::string cmdLine = BuildCommandLine( argc, argv );
 
     STARTUPINFOA si = {};
