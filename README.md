@@ -28,3 +28,38 @@ Tracy supports profiling CPU (Direct support is provided for C, C++, Lua, Python
 [New features in Tracy Profiler v0.6](https://www.youtube.com/watch?v=uJkrFgriuOo)  
 [New features in Tracy Profiler v0.7](https://www.youtube.com/watch?v=_hU7vw00MZ4)  
 [New features in Tracy Profiler v0.8](https://www.youtube.com/watch?v=30wpRpHTTag)
+
+## Standalone Sample Profiling (`tracy-monitor`)
+
+`tracy-monitor` samples applications without requiring source-level instrumentation or recompilation.
+
+> **Windows Note:** Profiling via ETW sampling and context switch monitoring requires running your command prompt or terminal as **Administrator**.
+
+### Usage
+
+* **Profile directly to a `.tracy` file** (headless capture):
+  ```sh
+  tracy-monitor -u -o my_trace.tracy ./my_app [args...]
+  ```
+  * `-u`, `--user-only`: Filters out kernel-mode callstack frames so samples and exclusive time are attributed directly to user-space functions without kernel interruptions (e.g. `KeSaveStateForHibernate`).
+  * `-o FILE`, `--output FILE`: Captures in-process and writes the trace directly to disk when the application exits or when interrupted (<kbd>Ctrl</kbd>+<kbd>C</kbd>).
+  * Open `my_trace.tracy` in `tracy-profiler` to inspect the results.
+
+* **Profile with live GUI connection**:
+  Launch the application under `tracy-monitor`:
+  ```sh
+  tracy-monitor -u ./my_app [args...]
+  ```
+  Then connect the GUI profiler (`tracy-profiler -a 127.0.0.1`).
+
+* **Attach to an existing process**:
+  ```sh
+  tracy-monitor -u -o my_trace.tracy -p <PID>
+  tracy-monitor -u -o my_trace.tracy -n my_app.exe
+  ```
+
+* **Inspect an existing trace in user-space only mode**:
+  Set the `TRACY_USER_ONLY_SAMPLES=1` environment variable before opening the trace:
+  ```sh
+  TRACY_USER_ONLY_SAMPLES=1 tracy-profiler my_trace.tracy
+  ```
