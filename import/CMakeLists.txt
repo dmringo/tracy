@@ -29,4 +29,10 @@ add_executable(tracy-import-fuchsia
 add_git_ref(tracy-import-fuchsia)
 target_link_libraries(tracy-import-fuchsia PRIVATE TracyServer)
 
+add_executable(tracy-import-rgp
+    src/import-rgp.cpp
+)
+add_git_ref(tracy-import-rgp)
+target_link_libraries(tracy-import-rgp PRIVATE TracyServer)
+
 set_property(DIRECTORY ${CMAKE_CURRENT_LIST_DIR} PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME})
