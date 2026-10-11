@@ -284,10 +284,10 @@ The current work is a prototype, not a verified implementation. The importer can
 ### Phase 4: Wavefront Wave-Slot Timeline [Prototype]
 * **Goal:** Display wavefront execution across GPU compute units, SIMDs, and wave slots.
 * **Files:** `server/TracyEvent.hpp`, `profiler/src/profiler/TracyTimelineItemWaveSlots.hpp/cpp`, and `profiler/src/profiler/TracyView_GpuWaveSlots.cpp`.
-* **Current scope:** Timeline and interaction scaffolding exist, but decoder timing, wave-to-state linkage, and CU placement are not reliable. Previously reported counts (including 72,202 wavefronts, 1.12 million state slices, and 40 CUs) came from the flawed decoder and are unvalidated.
+* **Current scope:** Timeline and interaction scaffolding exist. The importer now links state slices to completed waves, derives wave and slice intervals from SQTT timing tokens, and gates wave decoding to GFX10.3. CU placement and the NOP encodings still need independent validation beyond the available capture.
 
 ### Next Steps, In Order
-1. Fix SQTT decoding correctness: use per-stream clocks; link state slices to wave IDs; correct CU/WGP mapping; select token layouts only after checking the GPU architecture; decode marker streams into dispatch/draw zones and join real pipeline hashes to code objects using loader events.
+1. Independently validate GFX10.3 SQTT timing, NOP encodings, and CU/WGP placement; then decode marker streams into dispatch/draw zones and join real pipeline hashes to code objects using loader events.
 2. Replace hard-coded shader statistics with per-PC aggregation from `INST` tokens.
 3. Validate the resulting import and displayed data against independent tools and known captures before calling the phases verified.
 
@@ -326,13 +326,13 @@ After these correctness steps, remaining product work includes AMD_RDF (`libamdr
 ### 9.2. Known Limitations / Placeholder Data
 * **Queue and marker model:** Queues are pseudo-thread tracks, not real Tracy GPU contexts. SQTT is decoded only for wave tokens; marker streams (draws, dispatches, barriers, and pipeline names) are ignored, leaving only about 16 `CmdBuffer Submit` spans. Loader events (chunk 10) and `psoNames` are parsed but unused.
 * **SPM:** Only timestamps are read. No plots are created, and counter names are not resolved.
-* **Time conversion:** Tick-to-nanosecond conversion uses one calibration point at a fixed rate; observed 0.4–2.7% clock drift is not handled.
+* **Time conversion:** Queue timestamps use one calibration point at a fixed rate; observed 0.4–2.7% clock drift is not handled. Wave timelines are relative to each stream's first type-1 `TIMESTAMP` and are not aligned across streams.
 * **Shader statistics:** `issueCount` is fixed at 1, `totalActiveLanes` at 32, and stall values are guessed from instruction category. VGPR/SGPR counts are fixed at 32/48, and the shader stage is always Compute. Shader association uses `0x1000 + (cuId % elfCount)`, not code identity.
-* **Wave state:** State slices are appended to a global list without a wave ID; `stateCount` is never incremented and remains zero.
-* **SQTT timing and decoding:** Durations below 0 or above 1 ms are clamped to 450 ns; slices are fixed at 4 ns; `TIMESTAMP` tokens at or above 10 million are dropped; each stream starts from the calibration base rather than its own first timestamp; the GFX10 token layout is used regardless of GPU architecture; and unknown bytes advance by 4 bits, which can lose synchronization.
-* **Workgroup and CU mapping:** Only workgroup X is populated. CU ID is computed as `se * cuPerSe + wgp` using a 3-bit WGP field, which cannot correctly address a 40-CU device.
+* **SQTT wave decoder:** Wave slices are buffered per active wave and appended contiguously when that wave ends; `stateCount` reflects the appended slices. Per-stream time advances by token deltas, including `TIME`, `VALU`/`INST`, and timed wave tokens; durations are no longer clamped, and incomplete final tokens, invalid durations, and unterminated waves are counted. For the NAVI22 capture, the 8-bit `0xE`/`0xF` NOP interpretation eliminates the prior unknown-token/desynchronization run; AMD's public `rocprof-trace-decoder` GFX10 token table validates the other token prefixes and lengths, but does not document these NOP encodings, so their GFX10.3 layout remains capture-validated rather than independently verified. Only GFX10.3 is currently decoded; other architectures are skipped with a warning.
+* **Wave state meaning:** Slices are derived from `VALU` and `INST` token deltas and clipped to their parent wave interval. `INST` is represented as `SALU`, lane activity is fixed at 32, and stall categories are not decoded; these slices are not a complete hardware execution/stall breakdown.
+* **Workgroup and CU mapping:** GFX10 wave-start tokens do not provide workgroup coordinates, so all coordinates are zero. Physical CU placement uses the GFX10 SE/SA/WGP/SIMD fields and inferred two-CU-per-WGP grouping from the ASIC's two-SIMD-per-CU topology; that grouping has not been independently checked against a separate topology source.
 * **Schema compatibility:** The appended file block bumps `TracyVersion` to 0.14.3. This is a fork-local version change and will clash with the next upstream version unless coordinated.
-* **ISA disassembly and reported counts:** The disassembler is home-grown; its claimed 100% coverage and zero-placeholder result are unverified against LLVM's AMDGPU disassembler. Any concrete decoder-derived totals, including 72,202 concurrent wavefronts and 1.12 million state slices, are unvalidated and must not be treated as verification.
+* **ISA disassembly and reported counts:** The disassembler is home-grown and unverified against LLVM's AMDGPU disassembler. The NAVI22 capture now decodes 170,873 completed waves and 1,907,999 linked slices with no unknown tokens; these are decoder self-consistency statistics, not independent ground-truth counts.
 
 ### 9.3. Remaining Product Backlog
 * [ ] **Dual Shader Aggregation View:** Toggle between a selected-wave view and statistics aggregated across a shader or dispatch after per-PC statistics are correct.
