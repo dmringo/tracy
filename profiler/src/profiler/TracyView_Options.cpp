@@ -102,6 +102,11 @@ void View::DrawOptions()
         DefaultMarker(default_markers_active);
     }
 
+    val = m_vd.clampToTraceBounds;
+    ImGui::Checkbox( ICON_FA_LOCK " Clamp view to trace bounds", &val );
+    TooltipIfHovered( "Prevents zooming out into empty space and clamps panning to active trace bounds.\nShortcut: Press 'Home' to snap zoom to full trace." );
+    m_vd.clampToTraceBounds = val;
+
     const auto& sections = m_worker.GetSections();
     if( !sections.empty() )
     {

@@ -56,6 +56,7 @@ struct ViewData
     uint8_t ghostZones = true;
     ShortenName shortenName = ShortenName::NoSpaceAndNormalize;
 
+    uint8_t clampToTraceBounds = true;
     uint32_t frameTarget = 60;
 
     uint32_t plotHeight = 100;

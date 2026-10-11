@@ -107,6 +107,7 @@ set(SERVER_FILES
     TracyTimelineItemGpu.cpp
     TracyTimelineItemPlot.cpp
     TracyTimelineItemThread.cpp
+    TracyTimelineItemWaveSlots.cpp
     TracyUserData.cpp
     TracyUtility.cpp
     TracyView.cpp
@@ -123,6 +124,7 @@ set(SERVER_FILES
     TracyView_FrameTimeline.cpp
     TracyView_FrameTree.cpp
     TracyView_GpuTimeline.cpp
+    TracyView_GpuWaveSlots.cpp
     TracyView_Locks.cpp
     TracyView_Manual.cpp
     TracyView_Memory.cpp

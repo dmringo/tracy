@@ -220,6 +220,7 @@ public:
     void DrawDeadlockDetail( uint64_t thread, uint32_t lock ) const;
 
     bool DrawGpu( const TimelineContext& ctx, const GpuCtxData& gpu, int& offset );
+    bool DrawGpuWaveSlots( const TimelineContext& ctx, int& offset );
     bool DrawCpuData( const TimelineContext& ctx, const std::vector<CpuUsageDraw>& cpuDraw, const std::vector<std::vector<CpuCtxDraw>>& ctxDraw, int& offset, bool hasCpuData );
     void DrawThreadMigrations( const TimelineContext& ctx, const int origOffset, uint64_t thread );
     bool DrawSourceTooltip( const char* filename, uint32_t lineStart, uint32_t lineEnd, int before = 3, int after = 3, bool separateTooltip = true );
@@ -398,6 +399,8 @@ private:
     void DrawInfoWindow();
     void DrawZoneInfoWindow();
     void DrawGpuInfoWindow();
+    void DrawGpuShaderWindow();
+    void ShowGpuShader( uint64_t hash, uint32_t waveId = 0, uint32_t wgX = 0, uint32_t wgY = 0, uint32_t wgZ = 0 );
 
     template<typename Adapter, typename V>
     void DrawZoneInfoChildren( const V& children, int64_t ztime );
@@ -658,6 +661,13 @@ private:
     bool m_showWaitStacks = false;
     bool m_showFlameGraph = false;
     bool m_showManual = false;
+    bool m_showGpuShaderWindow = false;
+    uint64_t m_selectedGpuShader = 0;
+    uint32_t m_selectedGpuWaveId = 0;
+    uint32_t m_selectedGpuWgX = 0;
+    uint32_t m_selectedGpuWgY = 0;
+    uint32_t m_selectedGpuWgZ = 0;
+    bool m_focusGpuShaderWindow = false;
     bool m_manualPositionReset = false;
     bool m_showFrameStatistics = false;
 
@@ -759,6 +769,7 @@ private:
     bool m_firstFrame = true;
     std::chrono::time_point<std::chrono::high_resolution_clock> m_firstFrameTime;
     float m_yDelta = 0;
+    float m_vScrollDelta = 0;
 
     std::vector<SourceRegex> m_sourceSubstitutions;
     bool m_sourceRegexValid = true;

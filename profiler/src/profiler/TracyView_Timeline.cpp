@@ -8,6 +8,7 @@
 #include "TracyTimelineItemGpu.hpp"
 #include "TracyTimelineItemPlot.hpp"
 #include "TracyTimelineItemThread.hpp"
+#include "TracyTimelineItemWaveSlots.hpp"
 #include "TracyView.hpp"
 #include "../Fonts.hpp"
 
@@ -22,6 +23,7 @@ void View::HandleTimelineMouse( int64_t timespan, const ImVec2& wpos, float w )
     auto& io = ImGui::GetIO();
 
     const auto nspx = double( timespan ) / w;
+    const auto ty = ImGui::GetTextLineHeight();
 
     if( IsMouseClicked( ImGuiMouseButton_Left ) )
     {
@@ -104,7 +106,21 @@ void View::HandleTimelineMouse( int64_t timespan, const ImVec2& wpos, float w )
             m_vd.zvEnd -= dpx;
             io.MouseClickedPos[1].x = io.MousePos.x;
 
-            if( m_vd.zvStart < -1000ll * 1000 * 1000 * 60 * 60 * 24 * 5 )
+            if( m_vd.clampToTraceBounds && m_worker.GetLastTime() > 0 )
+            {
+                const auto range = m_vd.zvEnd - m_vd.zvStart;
+                if( m_vd.zvStart < 0 )
+                {
+                    m_vd.zvStart = 0;
+                    m_vd.zvEnd = m_vd.zvStart + range;
+                }
+                else if( m_vd.zvEnd > m_worker.GetLastTime() )
+                {
+                    m_vd.zvEnd = m_worker.GetLastTime();
+                    m_vd.zvStart = (std::max)( int64_t( 0 ), m_vd.zvEnd - range );
+                }
+            }
+            else if( m_vd.zvStart < -1000ll * 1000 * 1000 * 60 * 60 * 24 * 5 )
             {
                 const auto range = m_vd.zvEnd - m_vd.zvStart;
                 m_vd.zvStart = -1000ll * 1000 * 1000 * 60 * 60 * 24 * 5;
@@ -122,6 +138,11 @@ void View::HandleTimelineMouse( int64_t timespan, const ImVec2& wpos, float w )
     const bool wheel_zoom = abs( io.MouseWheel ) > abs( io.MouseWheelH );
     if( wheel_zoom )
     {
+        if( io.KeyShift )
+        {
+            m_vScrollDelta += io.MouseWheel * ty * 4.0f;
+            return;
+        }
         const auto wheel = io.MouseWheel;
         if( m_viewMode == ViewMode::LastFrames ) m_viewMode = ViewMode::LastRange;
         const double mouse = io.MousePos.x - wpos.x;
@@ -162,6 +183,29 @@ void View::HandleTimelineMouse( int64_t timespan, const ImVec2& wpos, float w )
             t1 += std::max( int64_t( 1 ), int64_t( p2 * mod ) );
         }
         t1 = std::max(t0, t1);
+        if( m_vd.clampToTraceBounds && m_worker.GetLastTime() > 0 )
+        {
+            const auto maxSpan = static_cast<int64_t>( m_worker.GetLastTime() * 1.05 );
+            if( t1 - t0 > maxSpan )
+            {
+                t0 = 0;
+                t1 = m_worker.GetLastTime();
+            }
+            else
+            {
+                if( t0 < 0 )
+                {
+                    t1 -= t0;
+                    t0 = 0;
+                }
+                if( t1 > m_worker.GetLastTime() )
+                {
+                    const auto diff = t1 - m_worker.GetLastTime();
+                    t0 = (std::max)( int64_t( 0 ), t0 - diff );
+                    t1 = m_worker.GetLastTime();
+                }
+            }
+        }
         ZoomToRange( t0, t1, !m_worker.IsConnected() || m_viewMode == ViewMode::Paused );
     }
 }
@@ -170,6 +214,20 @@ void View::HandleTimelineKeyboard( int64_t timespan, const ImVec2& wpos, float w
 {
     assert( timespan > 0 );
     auto& io = ImGui::GetIO();
+    const auto ty = ImGui::GetTextLineHeight();
+    if( ImGui::IsKeyPressed( ImGuiKey_Home ) )
+    {
+        ZoomToRange( m_worker.GetFirstTime(), m_worker.GetLastTime() );
+        return;
+    }
+    if( ImGui::IsKeyDown( ImGuiKey_PageUp ) || ( io.KeyShift && ImGui::IsKeyDown( ImGuiKey_UpArrow ) ) )
+    {
+        m_vScrollDelta += ty * 8.0f * (std::max)( io.DeltaTime * 60.0f, 1.0f );
+    }
+    else if( ImGui::IsKeyDown( ImGuiKey_PageDown ) || ( io.KeyShift && ImGui::IsKeyDown( ImGuiKey_DownArrow ) ) )
+    {
+        m_vScrollDelta -= ty * 8.0f * (std::max)( io.DeltaTime * 60.0f, 1.0f );
+    }
 
     int64_t nextTimelineRangeStart, nextTimelineRangeEnd;
     bool anyDeltaApplied = false;
@@ -352,8 +410,14 @@ void View::DrawTimeline()
     ImGui::SetNextWindowContentSize( ImVec2( 0, m_tc.GetHeight() ) );
     ImGui::BeginChild( "##zoneWin", ImVec2( ImGui::GetContentRegionAvail().x, ImGui::GetContentRegionAvail().y ), false, ImGuiWindowFlags_AlwaysVerticalScrollbar | ImGuiWindowFlags_NoScrollWithMouse );
 
+    if( m_vScrollDelta != 0 )
+    {
+        ImGui::SetScrollY( ImGui::GetScrollY() - m_vScrollDelta );
+        m_vScrollDelta = 0;
+    }
     if( m_yDelta != 0 )
     {
+        ImGui::SetScrollY( ImGui::GetScrollY() - m_yDelta );
         auto& io = ImGui::GetIO();
         io.MouseClickedPos[1].y = io.MousePos.y;
     }
@@ -374,6 +438,11 @@ void View::DrawTimeline()
         for( auto& v : m_worker.GetGpuData() )
         {
             m_tc.AddItem<TimelineItemGpu>( v );
+        }
+        if( m_worker.HasGpuWaveSlots() )
+        {
+            static char waveSlotsKey;
+            m_tc.AddItem<TimelineItemWaveSlots>( &waveSlotsKey );
         }
     }
     if( m_vd.drawCpuData && m_worker.HasContextSwitches() )

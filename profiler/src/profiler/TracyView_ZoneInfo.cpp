@@ -245,6 +245,10 @@ void View::DrawInfoWindow()
     {
         DrawGpuInfoWindow();
     }
+    if( m_showGpuShaderWindow )
+    {
+        DrawGpuShaderWindow();
+    }
 }
 
 void View::DrawZoneInfoWindow()

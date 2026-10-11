@@ -989,6 +989,20 @@ bool View::DrawImpl()
     ToggleButton( ICON_FA_SCALE_BALANCED " Compare", m_compare.show );
     ImGui::SameLine();
     ToggleButton( ICON_FA_FINGERPRINT " Info", m_showInfo );
+    if( !m_worker.GetGpuShaders().empty() )
+    {
+        ImGui::SameLine();
+        const bool prevShow = m_showGpuShaderWindow;
+        ToggleButton( ICON_FA_MICROCHIP " Shaders", m_showGpuShaderWindow );
+        if( m_showGpuShaderWindow && !prevShow )
+        {
+            if( m_selectedGpuShader == 0 )
+            {
+                m_selectedGpuShader = m_worker.GetGpuShaders().begin()->first;
+            }
+            m_focusGpuShaderWindow = true;
+        }
+    }
     ImGui::SameLine();
     if( ImGui::Button( ICON_FA_SCREWDRIVER_WRENCH ) ) ImGui::OpenPopup( "ToolsPopup" );
     if( ImGui::BeginPopup( "ToolsPopup" ) )
@@ -1123,11 +1137,21 @@ bool View::DrawImpl()
                 TextFocused( "Total time span:", TimeToString( lastTime ) );
             }
             ImGui::EndTooltip();
-            if( ImGui::IsItemClicked( 2 ) )
+            if( ImGui::IsItemClicked( 0 ) || ImGui::IsItemClicked( 2 ) )
             {
                 ZoomToRange( firstTime, lastTime );
             }
         }
+        ImGui::SameLine();
+        if( ImGui::SmallButton( m_vd.clampToTraceBounds ? ICON_FA_LOCK " Clamped" : ICON_FA_LOCK_OPEN " Free" ) )
+        {
+            m_vd.clampToTraceBounds = !m_vd.clampToTraceBounds;
+            if( m_vd.clampToTraceBounds )
+            {
+                ZoomToRange( firstTime, lastTime );
+            }
+        }
+        TooltipIfHovered( "Clamp view to trace bounds (prevents zooming or panning past start/end of active trace)\nShortcut: Press 'Home' key anytime to reset zoom to full trace." );
         ImGui::SameLine();
         dx = ImGui::GetCursorPosX() - cx;
         if( dx < targetLabelSize ) ImGui::SameLine( cx + targetLabelSize );
