@@ -31,6 +31,8 @@
 // RGP File Format Magic & Constants
 static constexpr uint32_t SQTT_FILE_MAGIC_NUMBER  = 0x50303042; // 'B00P'
 static constexpr uint32_t SQTT_FILE_HEADER_SIZE   = 56;
+static constexpr uint32_t SQTT_GFXIP_LEVEL_GFXIP_10_3 = 0x9;
+static constexpr int SQTT_SA_PER_SE = 2;
 
 // SQTT Chunk Types
 enum sqtt_file_chunk_type : uint8_t
@@ -156,8 +158,16 @@ enum SqttTokenType : uint8_t
     TOKEN_WAVE_START_EXT,
     TOKEN_WAVE_ALLOC,
     TOKEN_WAVE_END,
+    TOKEN_SHADER_DATA,
+    TOKEN_SHADER_DATA_SHORT,
+    TOKEN_UTIL_COUNTER,
     TOKEN_TIME,
     TOKEN_NOP,
+    TOKEN_MISC,
+    TOKEN_EVENT,
+    TOKEN_EVENT_SYNC,
+    TOKEN_REG,
+    TOKEN_REG_INIT,
     TOKEN_TIMESTAMP,
     TOKEN_HEADER,
 };
@@ -183,8 +193,18 @@ static const TokenEncoding s_gfx10Encodings[] = {
     { TOKEN_WAVE_START_EXT, 0b11100,   5, 48, 5,  7 },
     { TOKEN_WAVE_ALLOC,     0b00101,   5, 20, 5,  8 },
     { TOKEN_WAVE_END,       0b10101,   5, 20, 5,  8 },
+    { TOKEN_SHADER_DATA,    0b00110,   5, 52, 5,  8 },
+    { TOKEN_SHADER_DATA_SHORT, 0b10110, 5, 28, 5, 8 },
+    { TOKEN_UTIL_COUNTER,   0b0110001, 7, 64, 7,  9 },
     { TOKEN_TIME,           0b1000,    4,  8, 4,  8 },
     { TOKEN_NOP,            0b0000,    4,  4, 0,  0 },
+    { TOKEN_NOP,            0b1110,    4,  8, 0,  0 },
+    { TOKEN_NOP,            0b1111,    4,  8, 0,  0 },
+    { TOKEN_MISC,           0b1010001, 7, 24, 7, 16 },
+    { TOKEN_EVENT,          0b01100001, 8, 24, 8, 11 },
+    { TOKEN_EVENT_SYNC,     0b11100001, 8, 32, 8, 11 },
+    { TOKEN_REG,            0b1001,    4, 64, 4,  7 },
+    { TOKEN_REG_INIT,       0b1110001, 7, 64, 7, 10 },
     { TOKEN_TIMESTAMP,      0b0000001, 7, 64, 16, 64 },
     { TOKEN_HEADER,         0b0010001, 7, 64, 0,  0 },
 };
@@ -218,6 +238,37 @@ static void InitTokenTable()
     s_tableInitialized = true;
 }
 
+static bool Gfx10CuLocation( int se, int shaderEngines, int cuPerSe, int shaderArraysPerSe,
+    uint32_t sa, uint32_t wgp, uint32_t simd, int& cuId, uint32_t& simdInCu )
+{
+    constexpr int cusPerWgp = 2;
+    constexpr int simdsPerCu = 2;
+    if( se < 0 || se >= shaderEngines || shaderArraysPerSe <= 0 || cuPerSe % shaderArraysPerSe != 0 ) return false;
+    if( sa >= static_cast<uint32_t>( shaderArraysPerSe ) || simd >= cusPerWgp * simdsPerCu ) return false;
+
+    const int cusPerSa = cuPerSe / shaderArraysPerSe;
+    if( cusPerSa % cusPerWgp != 0 || wgp >= static_cast<uint32_t>( cusPerSa / cusPerWgp ) ) return false;
+
+    cuId = se * cuPerSe + sa * cusPerSa + wgp * cusPerWgp + simd / simdsPerCu;
+    simdInCu = simd % simdsPerCu;
+    return true;
+}
+
+static uint64_t ReadTokenWindow( const uint8_t* data, size_t bytes, size_t bitpos )
+{
+    const size_t byteIdx = bitpos / 8;
+    const size_t bitOffset = bitpos % 8;
+    uint64_t window = 0;
+    const size_t bytesToCopy = (std::min)( sizeof( window ), bytes - byteIdx );
+    memcpy( &window, data + byteIdx, bytesToCopy );
+    window >>= bitOffset;
+    if( bitOffset && byteIdx + sizeof( window ) < bytes )
+    {
+        window |= uint64_t( data[byteIdx + sizeof( window )] ) << ( 64 - bitOffset );
+    }
+    return window;
+}
+
 void Usage()
 {
     printf( "tracy-import-rgp %i.%i.%i / %s\n\n", tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch, tracy::GitRef );
@@ -240,6 +291,8 @@ struct SqttDecodeStats
     size_t wavesWithStates = 0;
     size_t unknownTokens = 0;
     size_t desyncs = 0;
+    size_t truncatedTokens = 0;
+    size_t invalidDurationWaves = 0;
     size_t unterminatedWaves = 0;
     size_t slicesOutsideWaves = 0;
 };
@@ -267,12 +320,10 @@ static void PrintSqttStats( const SqttDecodeStats& stats, size_t totalSlices )
         printf( "  wave duration ns (min/median/p99/max): unavailable\n" );
     }
 
-    printf( "  waves with stateCount > 0: %zu/%zu; total slices: %zu; slices outside wave: ",
-        stats.wavesWithStates, stats.waveDurations.size(), totalSlices );
-    if( stats.wavesWithStates == 0 ) printf( "unattributed\n" );
-    else printf( "%zu\n", stats.slicesOutsideWaves );
-    printf( "  unknown tokens: %zu; desyncs: %zu; unterminated waves: %zu\n",
-        stats.unknownTokens, stats.desyncs, stats.unterminatedWaves );
+    printf( "  waves with stateCount > 0: %zu/%zu; total slices: %zu; slices outside wave: %zu\n",
+        stats.wavesWithStates, stats.waveDurations.size(), totalSlices, stats.slicesOutsideWaves );
+    printf( "  unknown tokens: %zu; desyncs: %zu; truncated tokens: %zu; invalid-duration waves: %zu; unterminated waves: %zu\n",
+        stats.unknownTokens, stats.desyncs, stats.truncatedTokens, stats.invalidDurationWaves, stats.unterminatedWaves );
 }
 
 static const char* GetQueueTypeName( uint8_t qtype )
@@ -680,6 +731,8 @@ int main( int argc, char** argv )
     int32_t computeUnits = 40;
     int32_t shaderEngines = 2;
     int32_t wavesPerSimd = 20;
+    int32_t simdsPerCu = 0;
+    uint32_t sqttGfxipLevel = 0;
 
     uint64_t calibCpuTs = 0;
     uint64_t calibGpuTs = 0;
@@ -727,22 +780,28 @@ int main( int argc, char** argv )
                 shaderEngines = *reinterpret_cast<const int32_t*>( chunkPayload + 40 );
                 const int32_t cuPerSe = *reinterpret_cast<const int32_t*>( chunkPayload + 44 );
                 computeUnits = shaderEngines * cuPerSe;
+                simdsPerCu = *reinterpret_cast<const int32_t*>( chunkPayload + 48 );
                 wavesPerSimd = *reinterpret_cast<const int32_t*>( chunkPayload + 52 );
+                sqttGfxipLevel = *reinterpret_cast<const uint32_t*>( chunkPayload + 80 );
 
-                const char* nameStr = reinterpret_cast<const char*>( chunkPayload + 144 );
-                if( *nameStr )
+                const char* nameStr = reinterpret_cast<const char*>( chunkPayload + 136 );
+                const size_t nameCapacity = (std::min)( sizeof( gpuName ) - 1, payloadSize - 136 );
+                size_t nameLength = 0;
+                while( nameLength < nameCapacity && nameStr[nameLength] ) nameLength++;
+                if( nameLength > 0 )
                 {
-                    strncpy( gpuName, nameStr, sizeof( gpuName ) - 1 );
-                    gpuName[sizeof( gpuName ) - 1] = '\0';
+                    memcpy( gpuName, nameStr, nameLength );
+                    gpuName[nameLength] = '\0';
                 }
 
-                const uint64_t freq = *reinterpret_cast<const uint64_t*>( chunkPayload + 416 );
+                const uint64_t freq = *reinterpret_cast<const uint64_t*>( chunkPayload + 408 );
                 if( freq > 0 )
                 {
                     gpuTimestampFreq = freq;
                 }
             }
-            printf( "  ASIC: %s, %d CUs (%d SEs), %d Waves/SIMD, Freq: %llu Hz\n", gpuName, computeUnits, shaderEngines, wavesPerSimd, (unsigned long long)gpuTimestampFreq );
+            printf( "  ASIC: %s, GFX level 0x%x, %d CUs (%d SEs, %d SIMDs/CU), %d Waves/SIMD, Freq: %llu Hz\n",
+                gpuName, sqttGfxipLevel, computeUnits, shaderEngines, simdsPerCu, wavesPerSimd, (unsigned long long)gpuTimestampFreq );
             break;
         }
         case SQTT_FILE_CHUNK_TYPE_CLOCK_CALIBRATION:
@@ -863,6 +922,17 @@ int main( int argc, char** argv )
 
     printf( "Processed %zu chunks (%zu SQTT streams, %zu shader ELFs).\n", chunkCount, sqttStreams.size(), elfObjects.size() );
 
+    const bool sqttArchSupported = sqttGfxipLevel == SQTT_GFXIP_LEVEL_GFXIP_10_3 && simdsPerCu == 2;
+    if( sqttArchSupported )
+    {
+        printf( "  SQTT architecture: GFX10.3 (%s)\n", gpuName );
+    }
+    else
+    {
+        fprintf( stderr, "Warning: unsupported SQTT architecture for ASIC '%s' (GFX level 0x%x, %d SIMDs/CU); skipping SQTT wave decoding.\n",
+            gpuName, sqttGfxipLevel, simdsPerCu );
+    }
+
     // Timestamp Conversion Helper
     const uint64_t baseGpuTs = ( hasCalibration && calibGpuTs > 0 ) ? calibGpuTs : ( ( !queueEvents.empty() && queueEvents[0].gpu_timestamps[0] > 0 ) ? queueEvents[0].gpu_timestamps[0] : 0 );
 
@@ -973,8 +1043,7 @@ int main( int argc, char** argv )
     {
         int64_t startNs = 0;
         uint32_t wgid = 0;
-        uint32_t stateStart = 0;
-        uint32_t stateCount = 0;
+        std::vector<tracy::GpuWaveStateSlice> states;
         bool active = false;
     };
     std::unordered_map<uint64_t, ActiveWave> activeWaveMap;
@@ -986,6 +1055,8 @@ int main( int argc, char** argv )
 
     for( const auto& streamPair : sqttStreams )
     {
+        if( !sqttArchSupported ) break;
+
         const auto& desc = streamPair.first;
         const uint8_t* sData = streamPair.second.first;
         const size_t sBytes  = streamPair.second.second;
@@ -995,15 +1066,20 @@ int main( int argc, char** argv )
 
         size_t bitpos = 0;
         const size_t totalBits = sBytes * 8;
-        uint64_t currentGpuTime = baseGpuTs;
+        uint64_t currentGpuTime = 0;
+        uint64_t streamTimeOrigin = 0;
+        bool haveStreamTimestamp = false;
+        auto StreamTickToNs = [&]( uint64_t gpuTick ) -> int64_t {
+            const uint64_t relativeTick = gpuTick > streamTimeOrigin ? gpuTick - streamTimeOrigin : 0;
+            return static_cast<int64_t>( ( static_cast<double>( relativeTick ) / static_cast<double>( gpuTimestampFreq ) ) * 1e9 );
+        };
+        int targetCuId = -1;
+        uint32_t targetSimdInCu = 0;
+        bool targetLocationValid = false;
 
-        while( bitpos + 64 <= totalBits )
+        while( bitpos + 4 <= totalBits )
         {
-            const size_t byteIdx = bitpos / 8;
-            const size_t bitOffset = bitpos % 8;
-            uint64_t window = 0;
-            memcpy( &window, sData + byteIdx, 8 );
-            window >>= bitOffset;
+            const uint64_t window = ReadTokenWindow( sData, sBytes, bitpos );
 
             const uint8_t b8 = window & 0xFF;
             const auto& info = s_tokenTable[b8];
@@ -1012,64 +1088,114 @@ int main( int argc, char** argv )
             {
                 sqttStats.unknownTokens++;
                 sqttStats.desyncs++;
-            }
-
-            if( info.token_len == 0 )
-            {
                 bitpos += 4;
                 continue;
+            }
+            if( info.token_len > totalBits - bitpos )
+            {
+                sqttStats.desyncs++;
+                sqttStats.truncatedTokens++;
+                break;
+            }
+
+            const uint64_t previousGpuTime = currentGpuTime;
+            uint32_t timeDelta = 0;
+            if( info.type == TOKEN_TIMESTAMP )
+            {
+                const uint64_t tsType = ( window >> 14 ) & 0x3;
+                const uint64_t tsTime = window >> 16;
+                if( tsType == 1 )
+                {
+                    if( !haveStreamTimestamp )
+                    {
+                        streamTimeOrigin = currentGpuTime + tsTime;
+                        haveStreamTimestamp = true;
+                    }
+                    currentGpuTime += tsTime;
+                }
+            }
+            else if( info.time_end > info.time_begin )
+            {
+                timeDelta = ( window >> info.time_begin ) & ( ( 1 << ( info.time_end - info.time_begin ) ) - 1 );
+                currentGpuTime += timeDelta + ( info.type == TOKEN_TIME ? 4 : 0 );
             }
 
             if( info.type == TOKEN_WAVE_START || info.type == TOKEN_WAVE_START_EXT )
             {
                 const uint32_t simd = ( window >> 8 ) & 0x3;
                 const uint32_t wgp  = ( window >> 10 ) & 0x7;
+                const uint32_t sa   = ( window >> 7 ) & 0x1;
                 const uint32_t wid  = ( window >> 13 ) & 0x1F;
-                const uint32_t wgid = ( window >> 23 ) & 0x1F;
 
-                const int cuId = seIdx * cuPerSe + wgp;
-                if( cuId < totalCUs && wid < static_cast<uint32_t>( maxSlots ) )
+                int cuId;
+                uint32_t simdInCu;
+                if( Gfx10CuLocation( seIdx, shaderEngines, cuPerSe, SQTT_SA_PER_SE, sa, wgp, simd, cuId, simdInCu ) &&
+                    cuId < totalCUs && wid < static_cast<uint32_t>( maxSlots ) )
                 {
-                    const uint64_t key = ( static_cast<uint64_t>( cuId ) << 16 ) | ( simd << 8 ) | wid;
+                    const uint64_t key = ( static_cast<uint64_t>( cuId ) << 16 ) | ( simdInCu << 8 ) | wid;
                     ActiveWave& aw = activeWaveMap[key];
-                    aw.startNs = GpuTickToNs( currentGpuTime );
-                    aw.wgid = wgid;
-                    aw.stateStart = static_cast<uint32_t>( gpuWaveStates.size() );
-                    aw.stateCount = 0;
+                    if( aw.active ) sqttStats.unterminatedWaves++;
+                    aw.startNs = StreamTickToNs( currentGpuTime );
+                    aw.wgid = 0;
+                    aw.states.clear();
                     aw.active = true;
                 }
             }
             else if( info.type == TOKEN_WAVE_END )
             {
-                const uint32_t simd = ( window >> 8 ) & 0x3;
-                const uint32_t wgp  = ( window >> 10 ) & 0x7;
+                const uint32_t simd = ( window >> 9 ) & 0x3;
+                const uint32_t wgp  = ( window >> 11 ) & 0x7;
+                const uint32_t sa   = ( window >> 8 ) & 0x1;
                 const uint32_t wid  = ( window >> 15 ) & 0x1F;
 
-                const int cuId = seIdx * cuPerSe + wgp;
-                if( cuId < totalCUs && wid < static_cast<uint32_t>( maxSlots ) )
+                int cuId;
+                uint32_t simdInCu;
+                if( Gfx10CuLocation( seIdx, shaderEngines, cuPerSe, SQTT_SA_PER_SE, sa, wgp, simd, cuId, simdInCu ) &&
+                    cuId < totalCUs && wid < static_cast<uint32_t>( maxSlots ) )
                 {
-                    const uint64_t key = ( static_cast<uint64_t>( cuId ) << 16 ) | ( simd << 8 ) | wid;
+                    const uint64_t key = ( static_cast<uint64_t>( cuId ) << 16 ) | ( simdInCu << 8 ) | wid;
                     auto it = activeWaveMap.find( key );
                     if( it != activeWaveMap.end() && it->second.active )
                     {
-                        const int64_t endNs = GpuTickToNs( currentGpuTime );
-                        int64_t durNs = endNs - it->second.startNs;
-                        if( durNs < 0 || durNs > 1000000LL )
+                        const int64_t endNs = StreamTickToNs( currentGpuTime );
+                        const int64_t durNs = endNs - it->second.startNs;
+                        if( durNs < 0 )
                         {
-                            durNs = 450;
+                            sqttStats.invalidDurationWaves++;
+                            it->second.active = false;
+                            it->second.states.clear();
+                            bitpos += info.token_len;
+                            continue;
                         }
                         tracy::GpuWavefront wf {};
                         wf.start = it->second.startNs;
-                        wf.end = it->second.startNs + durNs;
+                        wf.end = endNs;
                         wf.workgroupX = it->second.wgid;
                         wf.workgroupY = 0;
                         wf.workgroupZ = 0;
                         wf.pipelineHash = !elfObjects.empty() ? ( 0x1000 + ( cuId % elfObjects.size() ) ) : 0;
-                        wf.stateStartIndex = it->second.stateStart;
                         wf.waveId = uint32_t( totalDecodedWaves + 1 );
-                        wf.stateCount = it->second.stateCount;
 
-                        gpuCUs[cuId].simds[simd].slots[wid].waves.push_back( wf );
+                        const size_t stateStart = gpuWaveStates.size();
+                        for( auto slice : it->second.states )
+                        {
+                            const int64_t sliceStart = slice.start.Val();
+                            const int64_t sliceEnd = sliceStart + slice.len;
+                            const int64_t clippedStart = (std::max)( sliceStart, wf.start.Val() );
+                            const int64_t clippedEnd = (std::min)( sliceEnd, wf.end.Val() );
+                            if( clippedEnd <= clippedStart ) continue;
+                            slice.start = clippedStart;
+                            slice.len = static_cast<uint32_t>( clippedEnd - clippedStart );
+                            if( slice.start.Val() < wf.start.Val() || slice.start.Val() + slice.len > wf.end.Val() )
+                            {
+                                sqttStats.slicesOutsideWaves++;
+                            }
+                            gpuWaveStates.push_back( slice );
+                        }
+                        wf.stateStartIndex = static_cast<uint32_t>( stateStart );
+                        wf.stateCount = static_cast<uint32_t>( gpuWaveStates.size() - stateStart );
+
+                        gpuCUs[cuId].simds[simdInCu].slots[wid].waves.push_back( wf );
                         if( seIdx >= 0 && static_cast<size_t>( seIdx ) < sqttStats.wavesPerSe.size() )
                         {
                             sqttStats.wavesPerSe[seIdx]++;
@@ -1077,52 +1203,55 @@ int main( int argc, char** argv )
                         sqttStats.waveDurations.push_back( durNs );
                         if( wf.stateCount > 0 ) sqttStats.wavesWithStates++;
                         it->second.active = false;
+                        it->second.states.clear();
                         totalDecodedWaves++;
                     }
                 }
             }
             else if( info.type == TOKEN_VALU || info.type == TOKEN_INST )
             {
-                const uint32_t wid = ( window >> 6 ) & 0x1F;
-                const uint32_t delta = ( window >> info.time_begin ) & ( ( 1 << ( info.time_end - info.time_begin ) ) - 1 );
-                currentGpuTime += delta;
+                const uint32_t wid = ( window >> ( info.type == TOKEN_INST ? 8 : 7 ) ) & 0x1F;
 
-                // Create a wave state slice
-                tracy::GpuWaveStateSlice slice {};
-                slice.start = GpuTickToNs( currentGpuTime );
-                slice.len = 4; // default issue cycles in ns
-                slice.state = ( info.type == TOKEN_VALU ) ? static_cast<uint8_t>( tracy::GpuWaveState::VALU ) : static_cast<uint8_t>( tracy::GpuWaveState::SALU );
-                slice.activeLanes = 32;
-                gpuWaveStates.push_back( slice );
-            }
-            else if( info.type == TOKEN_TIME )
-            {
-                const uint32_t delta = ( window >> 4 ) & 0xF;
-                currentGpuTime += delta + 4;
-            }
-            else if( info.type == TOKEN_TIMESTAMP )
-            {
-                const uint64_t unused = ( window >> 7 ) & 0x7F;
-                if( unused == 0 )
+                if( targetLocationValid && wid < static_cast<uint32_t>( maxSlots ) )
                 {
-                    const uint64_t tsType = ( window >> 14 ) & 0x3;
-                    const uint64_t tsTime = ( window >> 16 );
-                    if( tsType == 1 && tsTime < 10000000ULL )
+                    const uint64_t key = ( static_cast<uint64_t>( targetCuId ) << 16 ) | ( targetSimdInCu << 8 ) | wid;
+                    const auto active = activeWaveMap.find( key );
+                    if( active != activeWaveMap.end() && active->second.active )
                     {
-                        currentGpuTime += tsTime;
+                        const int64_t sliceStart = StreamTickToNs( previousGpuTime );
+                        const int64_t sliceEnd = StreamTickToNs( currentGpuTime );
+                        if( timeDelta > 0 && sliceEnd > sliceStart )
+                        {
+                            tracy::GpuWaveStateSlice slice {};
+                            slice.start = sliceStart;
+                            slice.len = static_cast<uint32_t>( sliceEnd - sliceStart );
+                            slice.state = ( info.type == TOKEN_VALU ) ? static_cast<uint8_t>( tracy::GpuWaveState::VALU ) : static_cast<uint8_t>( tracy::GpuWaveState::SALU );
+                            slice.activeLanes = 32;
+                            active->second.states.push_back( slice );
+                        }
                     }
                 }
+            }
+            else if( info.type == TOKEN_HEADER )
+            {
+                const uint32_t simd = ( window >> 13 ) & 0x3;
+                const uint32_t wgp = ( window >> 15 ) & 0x7;
+                const uint32_t sa = ( window >> 19 ) & 0x1;
+                targetLocationValid = Gfx10CuLocation( seIdx, shaderEngines, cuPerSe, SQTT_SA_PER_SE,
+                    sa, wgp, simd, targetCuId, targetSimdInCu ) && targetCuId < totalCUs;
             }
 
             bitpos += info.token_len;
         }
 
-        for( const auto& active : activeWaveMap )
+        for( auto& active : activeWaveMap )
         {
             const int cuId = static_cast<int>( active.first >> 16 );
             if( active.second.active && cuId >= seIdx * cuPerSe && cuId < ( seIdx + 1 ) * cuPerSe )
             {
                 sqttStats.unterminatedWaves++;
+                active.second.active = false;
+                active.second.states.clear();
             }
         }
     }
