@@ -38,4 +38,13 @@ add_executable(tracy-import-rgp
 add_git_ref(tracy-import-rgp)
 target_link_libraries(tracy-import-rgp PRIVATE TracyServer)
 
+if(TRACY_IMPORT_RGP_BUILD_TESTS)
+    enable_testing()
+    add_executable(tracy-import-rgp-tests
+        src/RgpSqtt.cpp
+        tests/RgpSqttTests.cpp
+    )
+    add_test(NAME tracy-import-rgp-tests COMMAND tracy-import-rgp-tests)
+endif()
+
 set_property(DIRECTORY ${CMAKE_CURRENT_LIST_DIR} PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME})
