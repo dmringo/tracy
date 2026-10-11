@@ -126,6 +126,18 @@ struct sqtt_clock_calibration_record
     uint64_t reserved;
 };
 
+struct ClockCalibrationPoint
+{
+    uint64_t cpuTimestamp;
+    uint64_t gpuTimestamp;
+};
+
+struct SqttRealtimePoint
+{
+    uint64_t shaderTimestamp;
+    uint64_t gpuTimestamp;
+};
+
 struct sqtt_pso_correlation_record
 {
     uint64_t api_pso_hash;
@@ -289,6 +301,7 @@ struct SqttDecodeStats
     std::vector<uint64_t> wavesPerSe;
     std::vector<int64_t> waveDurations;
     size_t wavesWithStates = 0;
+    size_t wavesOutsideSubmitSpans = 0;
     size_t unknownTokens = 0;
     size_t desyncs = 0;
     size_t truncatedTokens = 0;
@@ -322,6 +335,8 @@ static void PrintSqttStats( const SqttDecodeStats& stats, size_t totalSlices )
 
     printf( "  waves with stateCount > 0: %zu/%zu; total slices: %zu; slices outside wave: %zu\n",
         stats.wavesWithStates, stats.waveDurations.size(), totalSlices, stats.slicesOutsideWaves );
+    printf( "  waves outside any submit span (+/-10 us): %zu/%zu\n",
+        stats.wavesOutsideSubmitSpans, stats.waveDurations.size() );
     printf( "  unknown tokens: %zu; desyncs: %zu; truncated tokens: %zu; invalid-duration waves: %zu; unterminated waves: %zu\n",
         stats.unknownTokens, stats.desyncs, stats.truncatedTokens, stats.invalidDurationWaves, stats.unterminatedWaves );
 }
@@ -734,9 +749,7 @@ int main( int argc, char** argv )
     int32_t simdsPerCu = 0;
     uint32_t sqttGfxipLevel = 0;
 
-    uint64_t calibCpuTs = 0;
-    uint64_t calibGpuTs = 0;
-    bool hasCalibration = false;
+    std::vector<ClockCalibrationPoint> clockCalibrations;
 
     std::vector<sqtt_queue_info_record> queueInfos;
     std::vector<sqtt_queue_event_record> queueEvents;
@@ -809,9 +822,7 @@ int main( int argc, char** argv )
             if( payloadSize >= sizeof( sqtt_clock_calibration_record ) )
             {
                 const auto* calib = reinterpret_cast<const sqtt_clock_calibration_record*>( chunkPayload );
-                calibCpuTs = calib->cpu_timestamp;
-                calibGpuTs = calib->gpu_timestamp;
-                hasCalibration = true;
+                clockCalibrations.push_back( ClockCalibrationPoint { calib->cpu_timestamp, calib->gpu_timestamp } );
             }
             break;
         }
@@ -933,13 +944,166 @@ int main( int argc, char** argv )
             gpuName, sqttGfxipLevel, simdsPerCu );
     }
 
-    // Timestamp Conversion Helper
-    const uint64_t baseGpuTs = ( hasCalibration && calibGpuTs > 0 ) ? calibGpuTs : ( ( !queueEvents.empty() && queueEvents[0].gpu_timestamps[0] > 0 ) ? queueEvents[0].gpu_timestamps[0] : 0 );
+    // Clock calibration CPU timestamps use CLOCK_MONOTONIC and are expressed in nanoseconds.
+    std::stable_sort( clockCalibrations.begin(), clockCalibrations.end(), []( const auto& l, const auto& r ) {
+        return l.gpuTimestamp < r.gpuTimestamp;
+    } );
+    clockCalibrations.erase( std::unique( clockCalibrations.begin(), clockCalibrations.end(), []( const auto& l, const auto& r ) {
+        return l.gpuTimestamp == r.gpuTimestamp;
+    } ), clockCalibrations.end() );
+
+    const uint64_t fallbackBaseGpuTs = !queueEvents.empty() && queueEvents[0].gpu_timestamps[0] > 0 ? queueEvents[0].gpu_timestamps[0] : 0;
+    const uint64_t baseCpuTs = clockCalibrations.empty() ? 0 : clockCalibrations.front().cpuTimestamp;
+    const uint64_t sqttGpuOrigin = clockCalibrations.empty() ? fallbackBaseGpuTs : clockCalibrations.front().gpuTimestamp;
+    printf( "  Clock calibration points: %zu%s\n", clockCalibrations.size(),
+        clockCalibrations.empty() ? " (using nominal ASIC frequency)" : "" );
 
     auto GpuTickToNs = [&]( uint64_t gpuTick ) -> int64_t {
-        if( gpuTick < baseGpuTs ) return 0;
-        const double deltaTicks = static_cast<double>( gpuTick - baseGpuTs );
+        if( !clockCalibrations.empty() )
+        {
+            const ClockCalibrationPoint* lo;
+            const ClockCalibrationPoint* hi;
+            if( clockCalibrations.size() == 1 )
+            {
+                lo = hi = &clockCalibrations.front();
+            }
+            else
+            {
+                const auto upper = std::lower_bound( clockCalibrations.begin(), clockCalibrations.end(), gpuTick,
+                    []( const auto& point, uint64_t tick ) { return point.gpuTimestamp < tick; } );
+                if( upper == clockCalibrations.begin() )
+                {
+                    lo = &clockCalibrations[0];
+                    hi = &clockCalibrations[1];
+                }
+                else if( upper == clockCalibrations.end() )
+                {
+                    lo = &clockCalibrations[clockCalibrations.size() - 2];
+                    hi = &clockCalibrations.back();
+                }
+                else
+                {
+                    lo = &*( upper - 1 );
+                    hi = &*upper;
+                }
+            }
+
+            long double mappedCpuTs;
+            if( lo == hi || hi->gpuTimestamp == lo->gpuTimestamp )
+            {
+                mappedCpuTs = static_cast<long double>( lo->cpuTimestamp ) +
+                    ( static_cast<long double>( gpuTick ) - lo->gpuTimestamp ) * 1e9L / gpuTimestampFreq;
+            }
+            else
+            {
+                const long double cpuSpan = static_cast<long double>( hi->cpuTimestamp ) - lo->cpuTimestamp;
+                const long double gpuSpan = static_cast<long double>( hi->gpuTimestamp ) - lo->gpuTimestamp;
+                mappedCpuTs = static_cast<long double>( lo->cpuTimestamp ) +
+                    ( static_cast<long double>( gpuTick ) - lo->gpuTimestamp ) * cpuSpan / gpuSpan;
+            }
+            return static_cast<int64_t>( mappedCpuTs - baseCpuTs );
+        }
+
+        if( gpuTick < fallbackBaseGpuTs ) return 0;
+        const double deltaTicks = static_cast<double>( gpuTick - fallbackBaseGpuTs );
         return static_cast<int64_t>( ( deltaTicks / static_cast<double>( gpuTimestampFreq ) ) * 1e9 );
+    };
+
+    std::vector<std::vector<SqttRealtimePoint>> streamRealtimePoints( sqttStreams.size() );
+    size_t totalRealtimePoints = 0;
+    for( size_t streamIndex = 0; streamIndex < sqttStreams.size(); streamIndex++ )
+    {
+        const auto& streamPair = sqttStreams[streamIndex];
+        const uint8_t* streamData = streamPair.second.first;
+        const size_t streamBytes = streamPair.second.second;
+        const size_t totalBits = streamBytes * 8;
+        size_t bitpos = 0;
+        uint64_t shaderTimestamp = 0;
+        auto& points = streamRealtimePoints[streamIndex];
+
+        while( bitpos + 4 <= totalBits )
+        {
+            const uint64_t window = ReadTokenWindow( streamData, streamBytes, bitpos );
+            const auto& info = s_tokenTable[window & 0xFF];
+            if( info.type == TOKEN_UNKNOWN )
+            {
+                bitpos += 4;
+                continue;
+            }
+            if( info.token_len > totalBits - bitpos ) break;
+
+            if( info.type == TOKEN_TIMESTAMP )
+            {
+                const uint64_t timestampType = ( window >> 14 ) & 0x3;
+                const uint64_t timestamp = window >> 16;
+                if( timestampType == 1 )
+                {
+                    shaderTimestamp += timestamp;
+                }
+                else if( timestampType == 2 )
+                {
+                    points.push_back( SqttRealtimePoint { shaderTimestamp, timestamp } );
+                }
+            }
+            else if( info.time_end > info.time_begin )
+            {
+                const uint64_t timeMask = ( uint64_t( 1 ) << ( info.time_end - info.time_begin ) ) - 1;
+                shaderTimestamp += ( window >> info.time_begin ) & timeMask;
+                if( info.type == TOKEN_TIME ) shaderTimestamp += 4;
+            }
+
+            bitpos += info.token_len;
+        }
+
+        std::stable_sort( points.begin(), points.end(), []( const auto& l, const auto& r ) {
+            return l.shaderTimestamp < r.shaderTimestamp;
+        } );
+        points.erase( std::unique( points.begin(), points.end(), []( const auto& l, const auto& r ) {
+            return l.shaderTimestamp == r.shaderTimestamp;
+        } ), points.end() );
+        totalRealtimePoints += points.size();
+    }
+    printf( "  SQTT shader/GPU clock correlation points: %zu across %zu streams\n", totalRealtimePoints, sqttStreams.size() );
+
+    auto ShaderTickToGpuTick = [&]( const std::vector<SqttRealtimePoint>& points, uint64_t shaderTick ) -> uint64_t {
+        if( points.empty() ) return sqttGpuOrigin + shaderTick;
+        if( points.size() == 1 )
+        {
+            const long double gpuTick = static_cast<long double>( points.front().gpuTimestamp ) +
+                static_cast<long double>( shaderTick ) - points.front().shaderTimestamp;
+            if( gpuTick <= 0 ) return 0;
+            if( gpuTick >= static_cast<long double>( UINT64_MAX ) ) return UINT64_MAX;
+            return static_cast<uint64_t>( gpuTick );
+        }
+
+        const auto upper = std::lower_bound( points.begin(), points.end(), shaderTick,
+            []( const auto& point, uint64_t tick ) { return point.shaderTimestamp < tick; } );
+        const SqttRealtimePoint* lo;
+        const SqttRealtimePoint* hi;
+        if( upper == points.begin() )
+        {
+            lo = &points[0];
+            hi = &points[1];
+        }
+        else if( upper == points.end() )
+        {
+            lo = &points[points.size() - 2];
+            hi = &points.back();
+        }
+        else
+        {
+            lo = &*( upper - 1 );
+            hi = &*upper;
+        }
+
+        const long double shaderSpan = static_cast<long double>( hi->shaderTimestamp ) - lo->shaderTimestamp;
+        if( shaderSpan <= 0 ) return lo->gpuTimestamp;
+        const long double gpuTick = static_cast<long double>( lo->gpuTimestamp ) +
+            ( static_cast<long double>( shaderTick ) - lo->shaderTimestamp ) *
+            ( static_cast<long double>( hi->gpuTimestamp ) - lo->gpuTimestamp ) / shaderSpan;
+        if( gpuTick <= 0 ) return 0;
+        if( gpuTick >= static_cast<long double>( UINT64_MAX ) ) return UINT64_MAX;
+        return static_cast<uint64_t>( gpuTick );
     };
 
     // Prepare Tracy Ingestion Containers
@@ -947,6 +1111,18 @@ int main( int argc, char** argv )
     std::vector<tracy::Worker::ImportEventMessages> messages;
     std::vector<tracy::Worker::ImportEventPlots>    plots;
     std::unordered_map<uint64_t, std::string>      threadNames;
+
+    struct SubmitSpan
+    {
+        uint32_t queueIndex;
+        uint32_t cbId;
+        int64_t start;
+        int64_t end;
+    };
+    std::vector<SubmitSpan> submitSpans;
+    bool printedSubmitClockSample = false;
+    int64_t minSubmitStartNs = INT64_MAX;
+    int64_t maxSubmitEndNs = INT64_MIN;
 
     if( queueInfos.empty() )
     {
@@ -977,6 +1153,15 @@ int main( int argc, char** argv )
             {
                 const int64_t ts0 = GpuTickToNs( gpu0 );
                 const int64_t ts1 = GpuTickToNs( gpu1 );
+                if( !printedSubmitClockSample )
+                {
+                    printf( "  Submit GPU timestamps: %llu..%llu -> %lld..%lld ns\n",
+                        (unsigned long long)gpu0, (unsigned long long)gpu1, (long long)ts0, (long long)ts1 );
+                    printedSubmitClockSample = true;
+                }
+                submitSpans.push_back( SubmitSpan { ev.queue_info_index, ev.sqtt_cb_id, ts0, ts1 } );
+                minSubmitStartNs = (std::min)( minSubmitStartNs, ts0 );
+                maxSubmitEndNs = (std::max)( maxSubmitEndNs, ts1 );
 
                 char zoneName[128];
                 snprintf( zoneName, sizeof( zoneName ), "CmdBuffer Submit #%u", ev.sqtt_cb_id );
@@ -1012,6 +1197,11 @@ int main( int argc, char** argv )
                 "Frame"
             } );
         }
+    }
+    if( !submitSpans.empty() )
+    {
+        printf( "  Submit range: %lld..%lld ns (%zu spans)\n",
+            (long long)minSubmitStartNs, (long long)maxSubmitEndNs, submitSpans.size() );
     }
 
     // Decode SQTT Wavefront and Wave Slot Concurrency
@@ -1052,11 +1242,14 @@ int main( int argc, char** argv )
     sqttStats.wavesPerSe.resize( std::max( shaderEngines, 0 ) );
 
     size_t totalDecodedWaves = 0;
+    int64_t minWaveStartNs = INT64_MAX;
+    int64_t maxWaveEndNs = INT64_MIN;
 
-    for( const auto& streamPair : sqttStreams )
+    for( size_t streamIndex = 0; streamIndex < sqttStreams.size(); streamIndex++ )
     {
         if( !sqttArchSupported ) break;
 
+        const auto& streamPair = sqttStreams[streamIndex];
         const auto& desc = streamPair.first;
         const uint8_t* sData = streamPair.second.first;
         const size_t sBytes  = streamPair.second.second;
@@ -1067,11 +1260,8 @@ int main( int argc, char** argv )
         size_t bitpos = 0;
         const size_t totalBits = sBytes * 8;
         uint64_t currentGpuTime = 0;
-        uint64_t streamTimeOrigin = 0;
-        bool haveStreamTimestamp = false;
         auto StreamTickToNs = [&]( uint64_t gpuTick ) -> int64_t {
-            const uint64_t relativeTick = gpuTick > streamTimeOrigin ? gpuTick - streamTimeOrigin : 0;
-            return static_cast<int64_t>( ( static_cast<double>( relativeTick ) / static_cast<double>( gpuTimestampFreq ) ) * 1e9 );
+            return GpuTickToNs( ShaderTickToGpuTick( streamRealtimePoints[streamIndex], gpuTick ) );
         };
         int targetCuId = -1;
         uint32_t targetSimdInCu = 0;
@@ -1106,11 +1296,6 @@ int main( int argc, char** argv )
                 const uint64_t tsTime = window >> 16;
                 if( tsType == 1 )
                 {
-                    if( !haveStreamTimestamp )
-                    {
-                        streamTimeOrigin = currentGpuTime + tsTime;
-                        haveStreamTimestamp = true;
-                    }
                     currentGpuTime += tsTime;
                 }
             }
@@ -1170,11 +1355,19 @@ int main( int argc, char** argv )
                         tracy::GpuWavefront wf {};
                         wf.start = it->second.startNs;
                         wf.end = endNs;
+                        minWaveStartNs = (std::min)( minWaveStartNs, wf.start.Val() );
+                        maxWaveEndNs = (std::max)( maxWaveEndNs, wf.end.Val() );
                         wf.workgroupX = it->second.wgid;
                         wf.workgroupY = 0;
                         wf.workgroupZ = 0;
                         wf.pipelineHash = !elfObjects.empty() ? ( 0x1000 + ( cuId % elfObjects.size() ) ) : 0;
                         wf.waveId = uint32_t( totalDecodedWaves + 1 );
+
+                        constexpr int64_t submitToleranceNs = 10000;
+                        const bool overlapsSubmit = std::any_of( submitSpans.begin(), submitSpans.end(), [&]( const auto& span ) {
+                            return wf.start.Val() <= span.end + submitToleranceNs && wf.end.Val() >= span.start - submitToleranceNs;
+                        } );
+                        if( !overlapsSubmit ) sqttStats.wavesOutsideSubmitSpans++;
 
                         const size_t stateStart = gpuWaveStates.size();
                         for( auto slice : it->second.states )
@@ -1254,6 +1447,11 @@ int main( int argc, char** argv )
                 active.second.states.clear();
             }
         }
+    }
+
+    if( totalDecodedWaves > 0 )
+    {
+        printf( "  Wave range: %lld..%lld ns\n", (long long)minWaveStartNs, (long long)maxWaveEndNs );
     }
 
     printf( "Decoded %zu concurrent wavefronts across %d Compute Units.\n", totalDecodedWaves, totalCUs );
