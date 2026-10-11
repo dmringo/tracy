@@ -17,6 +17,8 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/vendor.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/GitRef.cmake)
 
+option(TRACY_IMPORT_RGP_BUILD_TESTS "Build the RGP SQTT decoder tests" OFF)
+
 add_executable(tracy-import-chrome
     src/import-chrome.cpp
 )
@@ -31,6 +33,7 @@ target_link_libraries(tracy-import-fuchsia PRIVATE TracyServer)
 
 add_executable(tracy-import-rgp
     src/import-rgp.cpp
+    src/RgpSqtt.cpp
 )
 add_git_ref(tracy-import-rgp)
 target_link_libraries(tracy-import-rgp PRIVATE TracyServer)

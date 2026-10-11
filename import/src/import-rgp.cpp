@@ -29,6 +29,28 @@
 #include "../../server/TracyWorker.hpp"
 #include "../../public/common/TracyVersion.hpp"
 #include "GitRef.hpp"
+#include "RgpSqtt.hpp"
+
+namespace rgp_sqtt = tracy::rgp_sqtt;
+using enum rgp_sqtt::SqttTokenType;
+using rgp_sqtt::DecodeMarkers;
+using rgp_sqtt::GetGfx10RegAddress;
+using rgp_sqtt::ReadGfx10Token;
+using rgp_sqtt::MarkerDecodeResult;
+using rgp_sqtt::SqttMarker;
+using rgp_sqtt::SqttToken;
+using rgp_sqtt::UserdataWord;
+using rgp_sqtt::MARKER_BARRIER_END;
+using rgp_sqtt::MARKER_BARRIER_START;
+using rgp_sqtt::MARKER_BIND_PIPELINE;
+using rgp_sqtt::MARKER_CB_END;
+using rgp_sqtt::MARKER_CB_START;
+using rgp_sqtt::MARKER_EVENT;
+using rgp_sqtt::MARKER_GENERAL_API;
+using rgp_sqtt::MARKER_LAYOUT_TRANSITION;
+using rgp_sqtt::MARKER_USER_EVENT;
+using rgp_sqtt::SQ_THREAD_TRACE_USERDATA_2;
+using rgp_sqtt::SQ_THREAD_TRACE_USERDATA_3;
 
 // RGP File Format Magic & Constants
 static constexpr uint32_t SQTT_FILE_MAGIC_NUMBER  = 0x50303042; // 'B00P'
@@ -140,17 +162,6 @@ struct SqttRealtimePoint
     uint64_t gpuTimestamp;
 };
 
-struct SqttMarker
-{
-    uint64_t shaderTimestamp;
-    uint8_t identifier;
-    uint32_t cbId;
-    uint32_t apiType;
-    uint32_t userEventType;
-    uint64_t pipelineHash;
-    std::string userEventName;
-};
-
 struct PendingZone
 {
     uint64_t tid;
@@ -179,100 +190,6 @@ struct sqtt_desc_record
 
 #pragma pack(pop)
 
-// GFX10 SQTT Token Types & Bitstream Lookup
-enum SqttTokenType : uint8_t
-{
-    TOKEN_UNKNOWN = 0,
-    TOKEN_INST,
-    TOKEN_VALU,
-    TOKEN_IMM_ONE,
-    TOKEN_IMMED,
-    TOKEN_WAVE_READY,
-    TOKEN_NEW_PC,
-    TOKEN_WAVE_START,
-    TOKEN_WAVE_START_EXT,
-    TOKEN_WAVE_ALLOC,
-    TOKEN_WAVE_END,
-    TOKEN_SHADER_DATA,
-    TOKEN_SHADER_DATA_SHORT,
-    TOKEN_UTIL_COUNTER,
-    TOKEN_TIME,
-    TOKEN_NOP,
-    TOKEN_MISC,
-    TOKEN_EVENT,
-    TOKEN_EVENT_SYNC,
-    TOKEN_REG,
-    TOKEN_REG_INIT,
-    TOKEN_TIMESTAMP,
-    TOKEN_HEADER,
-};
-
-struct TokenEncoding
-{
-    uint8_t type;
-    uint8_t pattern;
-    uint8_t pattern_len;
-    uint8_t token_len;
-    uint8_t time_begin;
-    uint8_t time_end;
-};
-
-static const TokenEncoding s_gfx10Encodings[] = {
-    { TOKEN_INST,           0b010,     3, 20, 4,  7 },
-    { TOKEN_VALU,           0b011,     3, 12, 3,  6 },
-    { TOKEN_IMM_ONE,        0b1101,    4, 12, 4,  7 },
-    { TOKEN_IMMED,          0b00100,   5, 24, 5,  8 },
-    { TOKEN_WAVE_READY,     0b10100,   5, 24, 5,  8 },
-    { TOKEN_NEW_PC,         0b0100001, 7, 64, 8, 11 },
-    { TOKEN_WAVE_START,     0b01100,   5, 32, 5,  7 },
-    { TOKEN_WAVE_START_EXT, 0b11100,   5, 48, 5,  7 },
-    { TOKEN_WAVE_ALLOC,     0b00101,   5, 20, 5,  8 },
-    { TOKEN_WAVE_END,       0b10101,   5, 20, 5,  8 },
-    { TOKEN_SHADER_DATA,    0b00110,   5, 52, 5,  8 },
-    { TOKEN_SHADER_DATA_SHORT, 0b10110, 5, 28, 5, 8 },
-    { TOKEN_UTIL_COUNTER,   0b0110001, 7, 64, 7,  9 },
-    { TOKEN_TIME,           0b1000,    4,  8, 4,  8 },
-    { TOKEN_NOP,            0b0000,    4,  4, 0,  0 },
-    { TOKEN_NOP,            0b1110,    4,  8, 0,  0 },
-    { TOKEN_NOP,            0b1111,    4,  8, 0,  0 },
-    { TOKEN_MISC,           0b1010001, 7, 24, 7, 16 },
-    { TOKEN_EVENT,          0b01100001, 8, 24, 8, 11 },
-    { TOKEN_EVENT_SYNC,     0b11100001, 8, 32, 8, 11 },
-    { TOKEN_REG,            0b1001,    4, 64, 4,  7 },
-    { TOKEN_REG_INIT,       0b1110001, 7, 64, 7, 10 },
-    { TOKEN_TIMESTAMP,      0b0000001, 7, 64, 16, 64 },
-    { TOKEN_HEADER,         0b0010001, 7, 64, 0,  0 },
-};
-
-struct TokenLookupEntry
-{
-    uint8_t type;
-    uint8_t token_len;
-    uint8_t time_begin;
-    uint8_t time_end;
-};
-
-static TokenLookupEntry s_tokenTable[256];
-static bool s_tableInitialized = false;
-
-static void InitTokenTable()
-{
-    if( s_tableInitialized ) return;
-    for( int i = 0; i < 256; i++ )
-    {
-        s_tokenTable[i] = { TOKEN_UNKNOWN, 4, 0, 0 };
-    }
-    for( const auto& enc : s_gfx10Encodings )
-    {
-        int step = 1 << enc.pattern_len;
-        for( int i = enc.pattern; i < 256; i += step )
-        {
-            s_tokenTable[i] = { enc.type, enc.token_len, enc.time_begin, enc.time_end };
-        }
-    }
-    s_tableInitialized = true;
-}
-
 static bool Gfx10CuLocation( int se, int shaderEngines, int cuPerSe, int shaderArraysPerSe,
     uint32_t sa, uint32_t wgp, uint32_t simd, int& cuId, uint32_t& simdInCu )
 {
@@ -287,21 +204,6 @@ static bool Gfx10CuLocation( int se, int shaderEngines, int cuPerSe, int shaderA
     cuId = se * cuPerSe + sa * cusPerSa + wgp * cusPerWgp + simd / simdsPerCu;
     simdInCu = simd % simdsPerCu;
     return true;
-}
-
-static uint64_t ReadTokenWindow( const uint8_t* data, size_t bytes, size_t bitpos )
-{
-    const size_t byteIdx = bitpos / 8;
-    const size_t bitOffset = bitpos % 8;
-    uint64_t window = 0;
-    const size_t bytesToCopy = (std::min)( sizeof( window ), bytes - byteIdx );
-    memcpy( &window, data + byteIdx, bytesToCopy );
-    window >>= bitOffset;
-    if( bitOffset && byteIdx + sizeof( window ) < bytes )
-    {
-        window |= uint64_t( data[byteIdx + sizeof( window )] ) << ( 64 - bitOffset );
-    }
-    return window;
 }
 
 void Usage()
@@ -654,8 +556,6 @@ int main( int argc, char** argv )
         SetConsoleMode( GetStdHandle( STD_OUTPUT_HANDLE ), 0x07 );
     }
 #endif
-
-    InitTokenTable();
 
     tracy::FileCompression clev = tracy::FileCompression::Fast;
 
@@ -1046,14 +946,15 @@ int main( int argc, char** argv )
 
         while( bitpos + 4 <= totalBits )
         {
-            const uint64_t window = ReadTokenWindow( streamData, streamBytes, bitpos );
-            const auto& info = s_tokenTable[window & 0xFF];
+            SqttToken token {};
+            if( !ReadGfx10Token( streamData, streamBytes, bitpos, token ) ) break;
+            const uint64_t window = token.window;
+            const auto& info = token.encoding;
             if( info.type == TOKEN_UNKNOWN )
             {
                 bitpos += 4;
                 continue;
             }
-            if( info.token_len > totalBits - bitpos ) break;
 
             if( info.type == TOKEN_TIMESTAMP )
             {
@@ -1205,30 +1106,7 @@ int main( int argc, char** argv )
             (long long)minSubmitStartNs, (long long)maxSubmitEndNs, submitSpans.size() );
     }
 
-    struct UserdataWord
-    {
-        uint16_t address;
-        uint32_t value;
-        uint64_t shaderTimestamp;
-    };
-    struct MarkerStreamDecode
-    {
-        std::vector<SqttMarker> markers;
-        size_t errors = 0;
-    };
-    // GFX10 uconfig register indices: (0x030D08 - 0x030000) / 4 and (0x030D0C - 0x030000) / 4.
-    constexpr uint16_t SQ_THREAD_TRACE_USERDATA_2 = 0x342;
-    constexpr uint16_t SQ_THREAD_TRACE_USERDATA_3 = 0x343;
-    constexpr uint8_t MARKER_EVENT = 0x0;
-    constexpr uint8_t MARKER_CB_START = 0x1;
-    constexpr uint8_t MARKER_CB_END = 0x2;
-    constexpr uint8_t MARKER_BARRIER_START = 0x3;
-    constexpr uint8_t MARKER_BARRIER_END = 0x4;
-    constexpr uint8_t MARKER_USER_EVENT = 0x5;
-    constexpr uint8_t MARKER_GENERAL_API = 0x6;
-    constexpr uint8_t MARKER_LAYOUT_TRANSITION = 0x9;
-    constexpr uint8_t MARKER_BIND_PIPELINE = 0xC;
-    std::vector<MarkerStreamDecode> markerStreams( sqttStreams.size() );
+    std::vector<MarkerDecodeResult> markerStreams( sqttStreams.size() );
     size_t selectedMarkerStream = SIZE_MAX;
 
     for( size_t streamIndex = 0; streamIndex < sqttStreams.size(); streamIndex++ )
@@ -1243,14 +1121,15 @@ int main( int argc, char** argv )
 
         while( bitpos + 4 <= totalBits )
         {
-            const uint64_t window = ReadTokenWindow( streamData, streamBytes, bitpos );
-            const auto& info = s_tokenTable[window & 0xFF];
+            SqttToken token {};
+            if( !ReadGfx10Token( streamData, streamBytes, bitpos, token ) ) break;
+            const uint64_t window = token.window;
+            const auto& info = token.encoding;
             if( info.type == TOKEN_UNKNOWN )
             {
                 bitpos += 4;
                 continue;
             }
-            if( info.token_len > totalBits - bitpos ) break;
 
             if( info.type == TOKEN_TIMESTAMP )
             {
@@ -1266,7 +1145,7 @@ int main( int argc, char** argv )
 
             if( info.type == TOKEN_REG )
             {
-                const uint16_t address = static_cast<uint16_t>( ( window >> 16 ) & 0xFFF );
+                const uint16_t address = GetGfx10RegAddress( window );
                 if( address == SQ_THREAD_TRACE_USERDATA_2 || address == SQ_THREAD_TRACE_USERDATA_3 )
                 {
                     words.push_back( UserdataWord { address, static_cast<uint32_t>( window >> 32 ), shaderTimestamp } );
@@ -1274,127 +1153,7 @@ int main( int argc, char** argv )
             }
             bitpos += info.token_len;
         }
-
-        uint32_t currentCbId = 0;
-        std::unordered_map<uint32_t, uint64_t> pipelineByCb;
-        size_t wordIndex = 0;
-        while( wordIndex < words.size() )
-        {
-            if( words[wordIndex].address != SQ_THREAD_TRACE_USERDATA_2 )
-            {
-                wordIndex++;
-                continue;
-            }
-
-            const uint32_t header = words[wordIndex].value;
-            const uint8_t identifier = static_cast<uint8_t>( header & 0xF );
-            if( identifier > MARKER_BIND_PIPELINE )
-            {
-                markerStreams[streamIndex].errors++;
-                wordIndex++;
-                continue;
-            }
-
-            size_t wordCount = 1 + ( ( header >> 4 ) & 0x7 );
-            uint32_t userEventType = UINT32_MAX;
-            switch( identifier )
-            {
-            case MARKER_CB_START: wordCount = 4; break;
-            case MARKER_CB_END: wordCount = 3; break;
-            case MARKER_EVENT: wordCount = ( ( header >> 31 ) & 1 ) ? 6 : 3; break;
-            case MARKER_BARRIER_START:
-            case MARKER_BARRIER_END:
-            case MARKER_LAYOUT_TRANSITION: wordCount = 2; break;
-            case MARKER_BIND_PIPELINE: wordCount = 3; break;
-            case MARKER_GENERAL_API: wordCount = 1; break;
-            case MARKER_USER_EVENT:
-            {
-                userEventType = ( header >> 12 ) & 0xFF;
-                if( userEventType == 2 || userEventType == 3 )
-                {
-                    if( wordIndex + 1 >= words.size() )
-                    {
-                        markerStreams[streamIndex].errors++;
-                        wordIndex++;
-                        continue;
-                    }
-                    const uint32_t stringLength = words[wordIndex + 1].value;
-                    if( stringLength > 1024 * 1024 )
-                    {
-                        markerStreams[streamIndex].errors++;
-                        wordIndex++;
-                        continue;
-                    }
-                    wordCount = 2 + ( stringLength + 3 ) / 4;
-                }
-                else
-                {
-                    wordCount = 1;
-                }
-                break;
-            }
-            default: break;
-            }
-            if( wordCount > words.size() - wordIndex )
-            {
-                markerStreams[streamIndex].errors++;
-                wordIndex++;
-                continue;
-            }
-
-            SqttMarker marker {};
-            marker.shaderTimestamp = words[wordIndex].shaderTimestamp;
-            marker.identifier = identifier;
-            marker.userEventType = userEventType;
-            marker.cbId = currentCbId;
-
-            switch( identifier )
-            {
-            case MARKER_CB_START:
-                marker.cbId = ( header >> 7 ) & 0xFFFFF;
-                currentCbId = marker.cbId;
-                break;
-            case MARKER_CB_END:
-            case MARKER_BARRIER_START:
-            case MARKER_BARRIER_END:
-                marker.cbId = ( header >> 7 ) & 0xFFFFF;
-                break;
-            case MARKER_EVENT:
-                marker.apiType = ( header >> 7 ) & 0xFFFFFF;
-                marker.cbId = words[wordIndex + 1].value & 0xFFFFF;
-                marker.pipelineHash = pipelineByCb[marker.cbId];
-                break;
-            case MARKER_GENERAL_API:
-                marker.apiType = ( header >> 7 ) & 0xFFFFF;
-                marker.pipelineHash = pipelineByCb[marker.cbId];
-                break;
-            case MARKER_BIND_PIPELINE:
-                marker.cbId = ( header >> 9 ) & 0xFFFFF;
-                marker.pipelineHash = uint64_t( words[wordIndex + 1].value ) |
-                    ( uint64_t( words[wordIndex + 2].value ) << 32 );
-                pipelineByCb[marker.cbId] = marker.pipelineHash;
-                break;
-            case MARKER_USER_EVENT:
-                if( userEventType == 2 || userEventType == 3 )
-                {
-                    const uint32_t stringLength = words[wordIndex + 1].value;
-                    marker.userEventName.reserve( stringLength );
-                    for( size_t byteIndex = 0; byteIndex < stringLength; byteIndex++ )
-                    {
-                        const uint32_t value = words[wordIndex + 2 + byteIndex / 4].value;
-                        marker.userEventName.push_back( static_cast<char>( ( value >> ( ( byteIndex % 4 ) * 8 ) ) & 0xFF ) );
-                    }
-                    while( !marker.userEventName.empty() && marker.userEventName.back() == '\0' ) marker.userEventName.pop_back();
-                }
-                break;
-            default:
-                break;
-            }
-
-            markerStreams[streamIndex].markers.push_back( std::move( marker ) );
-            if( identifier == MARKER_CB_END ) currentCbId = 0;
-            wordIndex += wordCount;
-        }
+        markerStreams[streamIndex] = DecodeMarkers( words );
 
         if( selectedMarkerStream == SIZE_MAX ||
             markerStreams[streamIndex].markers.size() > markerStreams[selectedMarkerStream].markers.size() ||
@@ -1719,10 +1478,15 @@ int main( int argc, char** argv )
 
         while( bitpos + 4 <= totalBits )
         {
-            const uint64_t window = ReadTokenWindow( sData, sBytes, bitpos );
-
-            const uint8_t b8 = window & 0xFF;
-            const auto& info = s_tokenTable[b8];
+            SqttToken token {};
+            if( !ReadGfx10Token( sData, sBytes, bitpos, token ) )
+            {
+                sqttStats.desyncs++;
+                sqttStats.truncatedTokens++;
+                break;
+            }
+            const uint64_t window = token.window;
+            const auto& info = token.encoding;
 
             if( info.type == TOKEN_UNKNOWN )
             {
@@ -1731,13 +1495,6 @@ int main( int argc, char** argv )
                 bitpos += 4;
                 continue;
             }
-            if( info.token_len > totalBits - bitpos )
-            {
-                sqttStats.desyncs++;
-                sqttStats.truncatedTokens++;
-                break;
-            }
-
             const uint64_t previousGpuTime = currentGpuTime;
             uint32_t timeDelta = 0;
             if( info.type == TOKEN_TIMESTAMP )
