@@ -4,12 +4,14 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <memory>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <sys/stat.h>
 #include <unordered_map>
 #include <vector>
@@ -136,6 +138,27 @@ struct SqttRealtimePoint
 {
     uint64_t shaderTimestamp;
     uint64_t gpuTimestamp;
+};
+
+struct SqttMarker
+{
+    uint64_t shaderTimestamp;
+    uint8_t identifier;
+    uint32_t cbId;
+    uint32_t apiType;
+    uint32_t userEventType;
+    uint64_t pipelineHash;
+    std::string userEventName;
+};
+
+struct PendingZone
+{
+    uint64_t tid;
+    int64_t start;
+    int64_t end;
+    std::string name;
+    std::string text;
+    uint32_t depth;
 };
 
 struct sqtt_pso_correlation_record
@@ -1111,6 +1134,7 @@ int main( int argc, char** argv )
     std::vector<tracy::Worker::ImportEventMessages> messages;
     std::vector<tracy::Worker::ImportEventPlots>    plots;
     std::unordered_map<uint64_t, std::string>      threadNames;
+    std::vector<PendingZone> pendingZones;
 
     struct SubmitSpan
     {
@@ -1120,7 +1144,6 @@ int main( int argc, char** argv )
         int64_t end;
     };
     std::vector<SubmitSpan> submitSpans;
-    bool printedSubmitClockSample = false;
     int64_t minSubmitStartNs = INT64_MAX;
     int64_t maxSubmitEndNs = INT64_MIN;
 
@@ -1153,12 +1176,6 @@ int main( int argc, char** argv )
             {
                 const int64_t ts0 = GpuTickToNs( gpu0 );
                 const int64_t ts1 = GpuTickToNs( gpu1 );
-                if( !printedSubmitClockSample )
-                {
-                    printf( "  Submit GPU timestamps: %llu..%llu -> %lld..%lld ns\n",
-                        (unsigned long long)gpu0, (unsigned long long)gpu1, (long long)ts0, (long long)ts1 );
-                    printedSubmitClockSample = true;
-                }
                 submitSpans.push_back( SubmitSpan { ev.queue_info_index, ev.sqtt_cb_id, ts0, ts1 } );
                 minSubmitStartNs = (std::min)( minSubmitStartNs, ts0 );
                 maxSubmitEndNs = (std::max)( maxSubmitEndNs, ts1 );
@@ -1169,23 +1186,7 @@ int main( int argc, char** argv )
                 char zoneText[128];
                 snprintf( zoneText, sizeof( zoneText ), "Frame %llu, SubIndex %u", (unsigned long long)ev.frame_index, ev.submit_sub_index );
 
-                timeline.emplace_back( tracy::Worker::ImportEventTimeline {
-                    pseudoTid,
-                    static_cast<uint64_t>( ts0 ),
-                    zoneName,
-                    zoneText,
-                    false,
-                    input,
-                    0
-                } );
-
-                timeline.emplace_back( tracy::Worker::ImportEventTimeline {
-                    pseudoTid,
-                    static_cast<uint64_t>( ts1 ),
-                    "",
-                    "",
-                    true
-                } );
+                pendingZones.push_back( PendingZone { pseudoTid, ts0, ts1, zoneName, zoneText, 0 } );
             }
         }
         else if( ev.event_type == SQTT_QUEUE_TIMING_EVENT_PRESENT && ev.gpu_timestamps[0] > 0 )
@@ -1202,6 +1203,455 @@ int main( int argc, char** argv )
     {
         printf( "  Submit range: %lld..%lld ns (%zu spans)\n",
             (long long)minSubmitStartNs, (long long)maxSubmitEndNs, submitSpans.size() );
+    }
+
+    struct UserdataWord
+    {
+        uint16_t address;
+        uint32_t value;
+        uint64_t shaderTimestamp;
+    };
+    struct MarkerStreamDecode
+    {
+        std::vector<SqttMarker> markers;
+        size_t errors = 0;
+    };
+    // GFX10 uconfig register indices: (0x030D08 - 0x030000) / 4 and (0x030D0C - 0x030000) / 4.
+    constexpr uint16_t SQ_THREAD_TRACE_USERDATA_2 = 0x342;
+    constexpr uint16_t SQ_THREAD_TRACE_USERDATA_3 = 0x343;
+    constexpr uint8_t MARKER_EVENT = 0x0;
+    constexpr uint8_t MARKER_CB_START = 0x1;
+    constexpr uint8_t MARKER_CB_END = 0x2;
+    constexpr uint8_t MARKER_BARRIER_START = 0x3;
+    constexpr uint8_t MARKER_BARRIER_END = 0x4;
+    constexpr uint8_t MARKER_USER_EVENT = 0x5;
+    constexpr uint8_t MARKER_GENERAL_API = 0x6;
+    constexpr uint8_t MARKER_LAYOUT_TRANSITION = 0x9;
+    constexpr uint8_t MARKER_BIND_PIPELINE = 0xC;
+    std::vector<MarkerStreamDecode> markerStreams( sqttStreams.size() );
+    size_t selectedMarkerStream = SIZE_MAX;
+
+    for( size_t streamIndex = 0; streamIndex < sqttStreams.size(); streamIndex++ )
+    {
+        const auto& streamPair = sqttStreams[streamIndex];
+        const uint8_t* streamData = streamPair.second.first;
+        const size_t streamBytes = streamPair.second.second;
+        const size_t totalBits = streamBytes * 8;
+        size_t bitpos = 0;
+        uint64_t shaderTimestamp = 0;
+        std::vector<UserdataWord> words;
+
+        while( bitpos + 4 <= totalBits )
+        {
+            const uint64_t window = ReadTokenWindow( streamData, streamBytes, bitpos );
+            const auto& info = s_tokenTable[window & 0xFF];
+            if( info.type == TOKEN_UNKNOWN )
+            {
+                bitpos += 4;
+                continue;
+            }
+            if( info.token_len > totalBits - bitpos ) break;
+
+            if( info.type == TOKEN_TIMESTAMP )
+            {
+                const uint64_t timestampType = ( window >> 14 ) & 0x3;
+                if( timestampType == 1 ) shaderTimestamp += window >> 16;
+            }
+            else if( info.time_end > info.time_begin )
+            {
+                const uint64_t timeMask = ( uint64_t( 1 ) << ( info.time_end - info.time_begin ) ) - 1;
+                shaderTimestamp += ( window >> info.time_begin ) & timeMask;
+                if( info.type == TOKEN_TIME ) shaderTimestamp += 4;
+            }
+
+            if( info.type == TOKEN_REG )
+            {
+                const uint16_t address = static_cast<uint16_t>( ( window >> 16 ) & 0xFFF );
+                if( address == SQ_THREAD_TRACE_USERDATA_2 || address == SQ_THREAD_TRACE_USERDATA_3 )
+                {
+                    words.push_back( UserdataWord { address, static_cast<uint32_t>( window >> 32 ), shaderTimestamp } );
+                }
+            }
+            bitpos += info.token_len;
+        }
+
+        uint32_t currentCbId = 0;
+        std::unordered_map<uint32_t, uint64_t> pipelineByCb;
+        size_t wordIndex = 0;
+        while( wordIndex < words.size() )
+        {
+            if( words[wordIndex].address != SQ_THREAD_TRACE_USERDATA_2 )
+            {
+                wordIndex++;
+                continue;
+            }
+
+            const uint32_t header = words[wordIndex].value;
+            const uint8_t identifier = static_cast<uint8_t>( header & 0xF );
+            if( identifier > MARKER_BIND_PIPELINE )
+            {
+                markerStreams[streamIndex].errors++;
+                wordIndex++;
+                continue;
+            }
+
+            size_t wordCount = 1 + ( ( header >> 4 ) & 0x7 );
+            uint32_t userEventType = UINT32_MAX;
+            switch( identifier )
+            {
+            case MARKER_CB_START: wordCount = 4; break;
+            case MARKER_CB_END: wordCount = 3; break;
+            case MARKER_EVENT: wordCount = ( ( header >> 31 ) & 1 ) ? 6 : 3; break;
+            case MARKER_BARRIER_START:
+            case MARKER_BARRIER_END:
+            case MARKER_LAYOUT_TRANSITION: wordCount = 2; break;
+            case MARKER_BIND_PIPELINE: wordCount = 3; break;
+            case MARKER_GENERAL_API: wordCount = 1; break;
+            case MARKER_USER_EVENT:
+            {
+                userEventType = ( header >> 12 ) & 0xFF;
+                if( userEventType == 2 || userEventType == 3 )
+                {
+                    if( wordIndex + 1 >= words.size() )
+                    {
+                        markerStreams[streamIndex].errors++;
+                        wordIndex++;
+                        continue;
+                    }
+                    const uint32_t stringLength = words[wordIndex + 1].value;
+                    if( stringLength > 1024 * 1024 )
+                    {
+                        markerStreams[streamIndex].errors++;
+                        wordIndex++;
+                        continue;
+                    }
+                    wordCount = 2 + ( stringLength + 3 ) / 4;
+                }
+                else
+                {
+                    wordCount = 1;
+                }
+                break;
+            }
+            default: break;
+            }
+            if( wordCount > words.size() - wordIndex )
+            {
+                markerStreams[streamIndex].errors++;
+                wordIndex++;
+                continue;
+            }
+
+            SqttMarker marker {};
+            marker.shaderTimestamp = words[wordIndex].shaderTimestamp;
+            marker.identifier = identifier;
+            marker.userEventType = userEventType;
+            marker.cbId = currentCbId;
+
+            switch( identifier )
+            {
+            case MARKER_CB_START:
+                marker.cbId = ( header >> 7 ) & 0xFFFFF;
+                currentCbId = marker.cbId;
+                break;
+            case MARKER_CB_END:
+            case MARKER_BARRIER_START:
+            case MARKER_BARRIER_END:
+                marker.cbId = ( header >> 7 ) & 0xFFFFF;
+                break;
+            case MARKER_EVENT:
+                marker.apiType = ( header >> 7 ) & 0xFFFFFF;
+                marker.cbId = words[wordIndex + 1].value & 0xFFFFF;
+                marker.pipelineHash = pipelineByCb[marker.cbId];
+                break;
+            case MARKER_GENERAL_API:
+                marker.apiType = ( header >> 7 ) & 0xFFFFF;
+                marker.pipelineHash = pipelineByCb[marker.cbId];
+                break;
+            case MARKER_BIND_PIPELINE:
+                marker.cbId = ( header >> 9 ) & 0xFFFFF;
+                marker.pipelineHash = uint64_t( words[wordIndex + 1].value ) |
+                    ( uint64_t( words[wordIndex + 2].value ) << 32 );
+                pipelineByCb[marker.cbId] = marker.pipelineHash;
+                break;
+            case MARKER_USER_EVENT:
+                if( userEventType == 2 || userEventType == 3 )
+                {
+                    const uint32_t stringLength = words[wordIndex + 1].value;
+                    marker.userEventName.reserve( stringLength );
+                    for( size_t byteIndex = 0; byteIndex < stringLength; byteIndex++ )
+                    {
+                        const uint32_t value = words[wordIndex + 2 + byteIndex / 4].value;
+                        marker.userEventName.push_back( static_cast<char>( ( value >> ( ( byteIndex % 4 ) * 8 ) ) & 0xFF ) );
+                    }
+                    while( !marker.userEventName.empty() && marker.userEventName.back() == '\0' ) marker.userEventName.pop_back();
+                }
+                break;
+            default:
+                break;
+            }
+
+            markerStreams[streamIndex].markers.push_back( std::move( marker ) );
+            if( identifier == MARKER_CB_END ) currentCbId = 0;
+            wordIndex += wordCount;
+        }
+
+        if( selectedMarkerStream == SIZE_MAX ||
+            markerStreams[streamIndex].markers.size() > markerStreams[selectedMarkerStream].markers.size() ||
+            ( markerStreams[streamIndex].markers.size() == markerStreams[selectedMarkerStream].markers.size() &&
+                markerStreams[streamIndex].errors < markerStreams[selectedMarkerStream].errors ) )
+        {
+            selectedMarkerStream = streamIndex;
+        }
+    }
+
+    std::array<size_t, 5> markerZoneCounts {};
+    size_t markerDecodeErrors = 0;
+    size_t unmatchedMarkers = 0;
+    size_t selectedMarkerCount = 0;
+    int selectedMarkerSe = -1;
+    if( selectedMarkerStream != SIZE_MAX )
+    {
+        const auto& decoded = markerStreams[selectedMarkerStream];
+        const auto& streamPoints = streamRealtimePoints[selectedMarkerStream];
+        selectedMarkerCount = decoded.markers.size();
+        markerDecodeErrors = decoded.errors;
+        selectedMarkerSe = sqttStreams[selectedMarkerStream].first.shader_engine_index;
+        auto FindSubmitSpan = [&]( uint32_t cbId, int64_t time ) -> const SubmitSpan* {
+            const SubmitSpan* match = nullptr;
+            int64_t bestDistance = INT64_MAX;
+            int64_t bestDuration = INT64_MAX;
+            bool bestExactCbId = false;
+            for( const auto& span : submitSpans )
+            {
+                const bool exactCbId = span.cbId == cbId;
+                const int64_t distance = time < span.start ? span.start - time : ( time > span.end ? time - span.end : 0 );
+                if( distance > 10000 ) continue;
+                const int64_t duration = span.end - span.start;
+                if( !match || ( exactCbId && !bestExactCbId ) ||
+                    ( exactCbId == bestExactCbId && ( distance < bestDistance ||
+                        ( distance == bestDistance && duration < bestDuration ) ) ) )
+                {
+                    match = &span;
+                    bestDistance = distance;
+                    bestDuration = duration;
+                    bestExactCbId = exactCbId;
+                }
+            }
+            return match;
+        };
+        auto MarkerTimeNs = [&]( const SqttMarker& marker ) {
+            return GpuTickToNs( ShaderTickToGpuTick( streamPoints, marker.shaderTimestamp ) );
+        };
+        struct OpenMarkerZone
+        {
+            size_t zoneIndex;
+            const SubmitSpan* span;
+        };
+        std::unordered_map<uint32_t, size_t> openCommandBuffers;
+        std::unordered_map<uint32_t, const SubmitSpan*> commandBufferSpans;
+        std::unordered_map<uint32_t, OpenMarkerZone> openEvents;
+        std::unordered_map<uint32_t, OpenMarkerZone> openBarriers;
+        std::unordered_map<uint32_t, std::vector<OpenMarkerZone>> openUserEvents;
+
+        auto AddMarkerZone = [&]( const SubmitSpan& span, int64_t start, int64_t end,
+            const std::string& name, const std::string& text, uint32_t depth, size_t kind ) -> size_t {
+            start = (std::max)( start, span.start );
+            end = (std::min)( end, span.end );
+            if( end < start ) end = start;
+            pendingZones.push_back( PendingZone { static_cast<uint64_t>( span.queueIndex + 1 ), start, end, name, text, depth } );
+            markerZoneCounts[kind]++;
+            return pendingZones.size() - 1;
+        };
+        auto CloseMarkerZone = [&]( OpenMarkerZone openZone, int64_t end ) {
+            auto& zone = pendingZones[openZone.zoneIndex];
+            zone.end = (std::max)( zone.start, (std::min)( end, openZone.span->end ) );
+        };
+        auto CloseEvent = [&]( uint32_t cbId, int64_t end ) {
+            const auto it = openEvents.find( cbId );
+            if( it != openEvents.end() )
+            {
+                CloseMarkerZone( it->second, end );
+                openEvents.erase( it );
+            }
+        };
+        auto EventName = []( uint32_t type ) -> const char* {
+            switch( type )
+            {
+            case 0: return "Draw";
+            case 1: return "DrawIndexed";
+            case 2: return "DrawIndirect";
+            case 3: return "DrawIndexedIndirect";
+            case 4: return "DrawIndirectCountAMD";
+            case 5: return "DrawIndexedIndirectCountAMD";
+            case 6: return "Dispatch";
+            case 7: return "DispatchIndirect";
+            case 41: return "DrawMeshTasks";
+            case 42: return "DrawMeshTasksIndirectCount";
+            case 43: return "DrawMeshTasksIndirect";
+            default: return "GPU Event";
+            }
+        };
+
+        for( const auto& marker : decoded.markers )
+        {
+            const int64_t time = MarkerTimeNs( marker );
+            const SubmitSpan* span = FindSubmitSpan( marker.cbId, time );
+            if( marker.identifier == MARKER_CB_START )
+            {
+                span = FindSubmitSpan( marker.cbId, time );
+                if( !span )
+                {
+                    unmatchedMarkers++;
+                    continue;
+                }
+                const size_t zoneIndex = AddMarkerZone( *span, time, span->end,
+                    "Command Buffer " + std::to_string( marker.cbId ), "", 1, 0 );
+                openCommandBuffers[marker.cbId] = zoneIndex;
+                commandBufferSpans[marker.cbId] = span;
+                continue;
+            }
+
+            if( marker.identifier == MARKER_CB_END )
+            {
+                CloseEvent( marker.cbId, time );
+                const auto barrier = openBarriers.find( marker.cbId );
+                if( barrier != openBarriers.end() )
+                {
+                    CloseMarkerZone( barrier->second, time );
+                    openBarriers.erase( barrier );
+                }
+                auto users = openUserEvents.find( marker.cbId );
+                if( users != openUserEvents.end() )
+                {
+                    for( const auto& user : users->second ) CloseMarkerZone( user, time );
+                    openUserEvents.erase( users );
+                }
+                const auto cb = openCommandBuffers.find( marker.cbId );
+                if( cb != openCommandBuffers.end() )
+                {
+                    const SubmitSpan* cbSpan = commandBufferSpans[marker.cbId];
+                    pendingZones[cb->second].end = (std::max)( pendingZones[cb->second].start,
+                        (std::min)( time, cbSpan->end ) );
+                    openCommandBuffers.erase( cb );
+                    commandBufferSpans.erase( marker.cbId );
+                }
+                continue;
+            }
+
+            if( !span ) span = commandBufferSpans.count( marker.cbId ) ? commandBufferSpans[marker.cbId] : nullptr;
+            if( !span )
+            {
+                unmatchedMarkers++;
+                continue;
+            }
+
+            if( marker.identifier == MARKER_EVENT )
+            {
+                CloseEvent( marker.cbId, time );
+                std::string name = EventName( marker.apiType );
+                const auto psoName = psoNames.find( marker.pipelineHash );
+                if( psoName != psoNames.end() && !psoName->second.empty() ) name += " - " + psoName->second;
+                const size_t zoneIndex = AddMarkerZone( *span, time, span->end, name,
+                    "Command " + std::to_string( marker.apiType ), 2, 1 );
+                openEvents[marker.cbId] = OpenMarkerZone { zoneIndex, span };
+            }
+            else if( marker.identifier == MARKER_BARRIER_START )
+            {
+                CloseEvent( marker.cbId, time );
+                const size_t zoneIndex = AddMarkerZone( *span, time, span->end, "Barrier", "", 2, 2 );
+                openBarriers[marker.cbId] = OpenMarkerZone { zoneIndex, span };
+            }
+            else if( marker.identifier == MARKER_BARRIER_END )
+            {
+                const auto it = openBarriers.find( marker.cbId );
+                if( it != openBarriers.end() )
+                {
+                    CloseMarkerZone( it->second, time );
+                    openBarriers.erase( it );
+                }
+                else
+                {
+                    AddMarkerZone( *span, time, time + 1, "Barrier End", "", 2, 2 );
+                }
+            }
+            else if( marker.identifier == MARKER_USER_EVENT )
+            {
+                if( marker.userEventType == 2 )
+                {
+                    const std::string name = marker.userEventName.empty() ? "User Event" : marker.userEventName;
+                    const size_t zoneIndex = AddMarkerZone( *span, time, span->end, name, name, 2, 3 );
+                    openUserEvents[marker.cbId].push_back( OpenMarkerZone { zoneIndex, span } );
+                }
+                else if( marker.userEventType == 1 )
+                {
+                    auto it = openUserEvents.find( marker.cbId );
+                    if( it != openUserEvents.end() && !it->second.empty() )
+                    {
+                        CloseMarkerZone( it->second.back(), time );
+                        it->second.pop_back();
+                        if( it->second.empty() ) openUserEvents.erase( it );
+                    }
+                }
+            }
+            else if( marker.identifier == MARKER_LAYOUT_TRANSITION )
+            {
+                AddMarkerZone( *span, time, time + 1, "Layout Transition", "", 2, 4 );
+            }
+        }
+
+        for( const auto& openEvent : openEvents ) CloseMarkerZone( openEvent.second, openEvent.second.span->end );
+        for( const auto& openBarrier : openBarriers ) CloseMarkerZone( openBarrier.second, openBarrier.second.span->end );
+        for( const auto& openUsers : openUserEvents )
+            for( const auto& user : openUsers.second ) CloseMarkerZone( user, user.span->end );
+        for( const auto& openCb : openCommandBuffers )
+        {
+            const SubmitSpan* span = commandBufferSpans[openCb.first];
+            pendingZones[openCb.second].end = span->end;
+        }
+    }
+
+    struct OrderedTimelineEvent
+    {
+        tracy::Worker::ImportEventTimeline event;
+        uint32_t depth;
+        size_t order;
+    };
+    std::vector<OrderedTimelineEvent> orderedTimeline;
+    orderedTimeline.reserve( pendingZones.size() * 2 );
+    size_t timelineOrder = 0;
+    for( const auto& zone : pendingZones )
+    {
+        orderedTimeline.push_back( OrderedTimelineEvent {
+            tracy::Worker::ImportEventTimeline { zone.tid, static_cast<uint64_t>( zone.start ), zone.name, zone.text, false, input, 0 },
+            zone.depth, timelineOrder++ } );
+        orderedTimeline.push_back( OrderedTimelineEvent {
+            tracy::Worker::ImportEventTimeline { zone.tid, static_cast<uint64_t>( zone.end ), "", "", true, "", 0 },
+            zone.depth, timelineOrder++ } );
+    }
+    std::stable_sort( orderedTimeline.begin(), orderedTimeline.end(), []( const auto& l, const auto& r ) {
+        if( l.event.timestamp != r.event.timestamp ) return l.event.timestamp < r.event.timestamp;
+        if( l.event.tid != r.event.tid ) return l.event.tid < r.event.tid;
+        if( l.event.isEnd != r.event.isEnd ) return l.event.isEnd;
+        if( l.depth != r.depth ) return l.event.isEnd ? l.depth > r.depth : l.depth < r.depth;
+        return l.order < r.order;
+    } );
+    timeline.reserve( orderedTimeline.size() );
+    for( auto& ordered : orderedTimeline ) timeline.push_back( std::move( ordered.event ) );
+
+    if( printStats )
+    {
+        if( selectedMarkerStream != SIZE_MAX )
+        {
+            printf( "  SQTT markers: SE %d, %zu decoded, %zu decode errors, %zu unmatched to submit spans\n",
+                selectedMarkerSe, selectedMarkerCount, markerDecodeErrors, unmatchedMarkers );
+        }
+        else
+        {
+            printf( "  SQTT markers: no SQTT streams available\n" );
+        }
+        printf( "  Marker zones: command buffers %zu, events %zu, barriers %zu, user events %zu, layout transitions %zu\n",
+            markerZoneCounts[0], markerZoneCounts[1], markerZoneCounts[2], markerZoneCounts[3], markerZoneCounts[4] );
     }
 
     // Decode SQTT Wavefront and Wave Slot Concurrency
