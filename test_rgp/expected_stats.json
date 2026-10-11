@@ -1,0 +1,100 @@
+{
+  "files": [
+    {
+      "path": "viewer_2024.03.04_20.17.09.rgp",
+      "gfxLevel": "0x9",
+      "waves": 170873,
+      "unknownTokens": 0,
+      "markers": 203,
+      "decodeErrors": 0
+    },
+    {
+      "path": "samples/bioshock_infinite.rgp",
+      "gfxLevel": "0xc",
+      "waves": 0,
+      "unknownTokens": 0,
+      "markers": 27200,
+      "decodeErrors": 15
+    },
+    {
+      "path": "samples/hl2_linux_2022.09.20_12.02.20.rgp",
+      "gfxLevel": "0x7",
+      "waves": 0,
+      "unknownTokens": 0,
+      "markers": 4081,
+      "decodeErrors": 1
+    },
+    {
+      "path": "samples/hl2_linux_2022.09.20_12.02.22.rgp",
+      "gfxLevel": "0x7",
+      "waves": 0,
+      "unknownTokens": 0,
+      "markers": 3282,
+      "decodeErrors": 0
+    },
+    {
+      "path": "samples/metro_2022.08.30_09.12.06.rgp",
+      "gfxLevel": "0x7",
+      "waves": 0,
+      "unknownTokens": 0,
+      "markers": 20957,
+      "decodeErrors": 0
+    },
+    {
+      "path": "samples/radeonsi-GeeXLab_2021.04.06_12.43.22.rgp",
+      "gfxLevel": "0x7",
+      "waves": 0,
+      "unknownTokens": 0,
+      "markers": 10,
+      "decodeErrors": 0
+    },
+    {
+      "path": "samples/radeonsi.rgp",
+      "gfxLevel": "0x7",
+      "waves": 0,
+      "unknownTokens": 0,
+      "markers": 107,
+      "decodeErrors": 2
+    },
+    {
+      "path": "samples/radeonsi_hl2_linux_2022.09.27_11.09.01.rgp",
+      "gfxLevel": "0x7",
+      "waves": 0,
+      "unknownTokens": 0,
+      "markers": 602,
+      "decodeErrors": 2
+    },
+    {
+      "path": "samples/radeonsi_hl2_linux_2022.09.27_11.11.02.rgp",
+      "gfxLevel": "0x7",
+      "waves": 0,
+      "unknownTokens": 0,
+      "markers": 656,
+      "decodeErrors": 2
+    },
+    {
+      "path": "samples/zink-GeeXLab_2021.04.06_12.42.47.rgp",
+      "gfxLevel": "0x7",
+      "waves": 0,
+      "unknownTokens": 0,
+      "markers": 108,
+      "decodeErrors": 0
+    },
+    {
+      "path": "samples/zink-GeeXLab_2021.04.06_15.22.34.rgp",
+      "gfxLevel": "0x7",
+      "waves": 0,
+      "unknownTokens": 0,
+      "markers": 108,
+      "decodeErrors": 0
+    },
+    {
+      "path": "samples/zink.rgp",
+      "gfxLevel": "0x7",
+      "waves": 0,
+      "unknownTokens": 0,
+      "markers": 791,
+      "decodeErrors": 0
+    }
+  ]
+}
