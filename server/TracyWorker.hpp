@@ -431,7 +431,12 @@ private:
         Vector<SectionItem> sectionsPending;
         unordered_flat_map<uint64_t, uint16_t> sectionsActive;
         unordered_flat_map<uint16_t, StringIdx> sectionsDescription;
+
+        Vector<GpuComputeUnit> gpuComputeUnits;
+        Vector<GpuWaveStateSlice> gpuWaveStates;
+        unordered_flat_map<uint64_t, GpuShaderData> gpuShaders;
     };
+
 
     struct MbpsBlock
     {
@@ -584,6 +589,30 @@ public:
     uint64_t GetSourceFileCacheSize() const;
     MemoryBlock GetSourceFileFromCache( const char* file ) const;
     HwSampleData* GetHwSampleData( uint64_t addr );
+    const Vector<GpuComputeUnit>& GetGpuComputeUnits() const { return m_data.gpuComputeUnits; }
+    const Vector<GpuWaveStateSlice>& GetGpuWaveStates() const { return m_data.gpuWaveStates; }
+    const unordered_flat_map<uint64_t, GpuShaderData>& GetGpuShaders() const { return m_data.gpuShaders; }
+    bool HasGpuWaveSlots() const { return !m_data.gpuComputeUnits.empty(); }
+    void InsertGpuComputeUnits( Vector<GpuComputeUnit>&& cus )
+    {
+        for( const auto& cu : cus )
+        {
+            for( int s = 0; s < 4; s++ )
+            {
+                for( const auto& slot : cu.simds[s].slots )
+                {
+                    if( !slot.waves.empty() )
+                    {
+                        const int64_t wEnd = slot.waves.back().end.Val();
+                        if( m_data.lastTime < wEnd ) m_data.lastTime = wEnd;
+                    }
+                }
+            }
+        }
+        m_data.gpuComputeUnits = std::move( cus );
+    }
+    void InsertGpuWaveStates( Vector<GpuWaveStateSlice>&& states ) { m_data.gpuWaveStates = std::move( states ); }
+    void InsertGpuShader( uint64_t hash, GpuShaderData&& shader ) { m_data.gpuShaders.emplace( hash, std::move( shader ) ); }
 
     int64_t GetFrameTime( const FrameData& fd, size_t idx ) const;
     int64_t GetFrameBegin( const FrameData& fd, size_t idx ) const;

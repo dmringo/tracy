@@ -58,6 +58,7 @@ static const uint8_t FileHeader[8] { 't', 'r', 'a', 'c', 'y', Version::Major, Ve
 constexpr size_t FileHeaderMagic = 5;
 static const int CurrentVersion = FileVersion( Version::Major, Version::Minor, Version::Patch );
 static const int MinSupportedVersion = FileVersion( 0, 11, 0 );
+static const int VersionWithGpuWaveSlots = FileVersion( 0, 14, 3 );
 
 
 
@@ -1620,6 +1621,84 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             f.Skip( s32 );
             f.Read( s32 );
             f.Skip( s32 );
+        }
+    }
+
+    if( fileVer >= VersionWithGpuWaveSlots )
+    {
+        uint32_t numCu;
+        f.Read( numCu );
+        m_data.gpuComputeUnits.reserve_exact( numCu, m_slab );
+        for( uint32_t c = 0; c < numCu; c++ )
+        {
+            auto& cu = m_data.gpuComputeUnits[c];
+            f.Read( cu.cuId );
+            for( int s = 0; s < 4; s++ )
+            {
+                uint32_t numSlots;
+                f.Read( numSlots );
+                cu.simds[s].slots.reserve_exact( numSlots, m_slab );
+                for( uint32_t sl = 0; sl < numSlots; sl++ )
+                {
+                    auto& slot = cu.simds[s].slots[sl];
+                    uint32_t numWaves;
+                    f.Read( numWaves );
+                    if( numWaves > 0 )
+                    {
+                        slot.waves.reserve_exact( numWaves, m_slab );
+                        f.Read( slot.waves.data(), sizeof( GpuWavefront ) * numWaves );
+                        const int64_t wEnd = slot.waves.back().end.Val();
+                        if( m_data.lastTime < wEnd ) m_data.lastTime = wEnd;
+                    }
+                }
+            }
+        }
+
+        uint64_t numStates;
+        f.Read( numStates );
+        if( numStates > 0 )
+        {
+            m_data.gpuWaveStates.reserve_exact( numStates, m_slab );
+            f.Read( m_data.gpuWaveStates.data(), sizeof( GpuWaveStateSlice ) * numStates );
+        }
+
+        uint32_t numShaders;
+        f.Read( numShaders );
+        m_data.gpuShaders.reserve( numShaders );
+        for( uint32_t i = 0; i < numShaders; i++ )
+        {
+            uint64_t hash;
+            f.Read( hash );
+            GpuShaderData shader;
+            shader.pipelineHash = hash;
+            f.Read( shader.shaderName );
+            f.Read( shader.shaderStage );
+            f.Read( shader.vgprCount );
+            f.Read( shader.sgprCount );
+            f.Read( shader.ldsSize );
+            f.Read( shader.maxOccupancy );
+
+            uint32_t numLines;
+            f.Read( numLines );
+            if( numLines > 0 )
+            {
+                shader.isaLines.reserve_exact( numLines, m_slab );
+                f.Read( shader.isaLines.data(), sizeof( StringIdx ) * numLines );
+                shader.isaLinePcs.reserve_exact( numLines, m_slab );
+                f.Read( shader.isaLinePcs.data(), sizeof( uint64_t ) * numLines );
+            }
+
+            uint32_t numStats;
+            f.Read( numStats );
+            shader.instructionStats.reserve( numStats );
+            for( uint32_t j = 0; j < numStats; j++ )
+            {
+                GpuInstructionStats st;
+                f.Read( st );
+                shader.instructionStats.emplace( st.pc, st );
+            }
+
+            m_data.gpuShaders.emplace( hash, std::move( shader ) );
         }
     }
 
@@ -8788,6 +8867,64 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( v.first, s32 );
         f.Write( &v.second.len, sizeof( v.second.len ) );
         f.Write( v.second.data, v.second.len );
+    }
+
+    // GPU Wave Slots & Compute Units
+    uint32_t numCu = uint32_t( m_data.gpuComputeUnits.size() );
+    f.Write( &numCu, sizeof( numCu ) );
+    for( auto& cu : m_data.gpuComputeUnits )
+    {
+        f.Write( &cu.cuId, sizeof( cu.cuId ) );
+        for( int s = 0; s < 4; s++ )
+        {
+            uint32_t numSlots = uint32_t( cu.simds[s].slots.size() );
+            f.Write( &numSlots, sizeof( numSlots ) );
+            for( auto& slot : cu.simds[s].slots )
+            {
+                uint32_t numWaves = uint32_t( slot.waves.size() );
+                f.Write( &numWaves, sizeof( numWaves ) );
+                if( numWaves > 0 )
+                {
+                    f.Write( slot.waves.data(), sizeof( GpuWavefront ) * numWaves );
+                }
+            }
+        }
+    }
+
+    uint64_t numStates = m_data.gpuWaveStates.size();
+    f.Write( &numStates, sizeof( numStates ) );
+    if( numStates > 0 )
+    {
+        f.Write( m_data.gpuWaveStates.data(), sizeof( GpuWaveStateSlice ) * numStates );
+    }
+
+    uint32_t numShaders = uint32_t( m_data.gpuShaders.size() );
+    f.Write( &numShaders, sizeof( numShaders ) );
+    for( auto& sh : m_data.gpuShaders )
+    {
+        f.Write( &sh.first, sizeof( sh.first ) );
+        auto& s = sh.second;
+        f.Write( &s.shaderName, sizeof( s.shaderName ) );
+        f.Write( &s.shaderStage, sizeof( s.shaderStage ) );
+        f.Write( &s.vgprCount, sizeof( s.vgprCount ) );
+        f.Write( &s.sgprCount, sizeof( s.sgprCount ) );
+        f.Write( &s.ldsSize, sizeof( s.ldsSize ) );
+        f.Write( &s.maxOccupancy, sizeof( s.maxOccupancy ) );
+
+        uint32_t numLines = uint32_t( s.isaLines.size() );
+        f.Write( &numLines, sizeof( numLines ) );
+        if( numLines > 0 )
+        {
+            f.Write( s.isaLines.data(), sizeof( StringIdx ) * numLines );
+            f.Write( s.isaLinePcs.data(), sizeof( uint64_t ) * numLines );
+        }
+
+        uint32_t numStats = uint32_t( s.instructionStats.size() );
+        f.Write( &numStats, sizeof( numStats ) );
+        for( auto& st : s.instructionStats )
+        {
+            f.Write( &st.second, sizeof( GpuInstructionStats ) );
+        }
     }
 }
 

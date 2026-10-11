@@ -821,6 +821,88 @@ struct FlameGraphItem
     std::vector<FlameGraphItem> children;
 };
 
+enum class GpuWaveState : uint8_t
+{
+    Empty = 0,
+    Idle,
+    VALU,
+    SALU,
+    VMEM_Wait,
+    SMEM_Wait,
+    LDS_Wait,
+    Barrier_Wait,
+    Other_Stall
+};
+
+#pragma pack( push, 1 )
+
+struct GpuWaveStateSlice
+{
+    Int48 start;
+    uint32_t len;
+    uint8_t state;
+    uint8_t activeLanes;
+};
+
+struct GpuWavefront
+{
+    Int48 start;
+    Int48 end;
+    uint32_t workgroupX : 10;
+    uint32_t workgroupY : 10;
+    uint32_t workgroupZ : 10;
+    uint32_t reserved   : 2;
+    uint32_t pipelineHash;
+    uint32_t stateStartIndex;
+    uint32_t stateCount;
+    uint32_t waveId;
+};
+
+#pragma pack( pop )
+
+struct GpuSimdSlotData
+{
+    Vector<GpuWavefront> waves;
+};
+
+struct GpuSimdUnit
+{
+    Vector<GpuSimdSlotData> slots;
+};
+
+struct GpuComputeUnit
+{
+    uint16_t cuId;
+    GpuSimdUnit simds[4];
+};
+
+struct GpuInstructionStats
+{
+    uint64_t pc;
+    uint32_t issueCount;
+    uint64_t totalActiveLanes;
+    uint32_t vmemStallCycles;
+    uint32_t smemStallCycles;
+    uint32_t ldsStallCycles;
+    uint32_t aluStallCycles;
+    uint16_t avgVgprUsage;
+    uint8_t category;
+};
+
+struct GpuShaderData
+{
+    uint64_t pipelineHash;
+    StringIdx shaderName;
+    uint8_t shaderStage;
+    uint16_t vgprCount;
+    uint16_t sgprCount;
+    uint32_t ldsSize;
+    uint32_t maxOccupancy;
+    Vector<StringIdx> isaLines;
+    Vector<uint64_t> isaLinePcs;
+    unordered_flat_map<uint64_t, GpuInstructionStats> instructionStats;
+};
+
 }
 
 #endif
