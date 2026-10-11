@@ -221,7 +221,7 @@ static void InitTokenTable()
 void Usage()
 {
     printf( "tracy-import-rgp %i.%i.%i / %s\n\n", tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch, tracy::GitRef );
-    printf( "Usage: import-rgp input.rgp output.tracy\n\n" );
+    printf( "Usage: import-rgp [--stats] input.rgp output.tracy\n\n" );
     printf( "Imports AMD Radeon GPU Profiler (.rgp) traces into Tracy Profiler format.\n" );
     printf( "Supports:\n" );
     printf( "  - Wave-Slot execution timeline (CU -> SIMD -> Slot multi-wave concurrency)\n" );
@@ -231,6 +231,48 @@ void Usage()
     printf( "  - Frame presentation marks\n" );
     printf( "  - SPM counter time-series plots (wavefront occupancy / GPU metrics)\n" );
     exit( 1 );
+}
+
+struct SqttDecodeStats
+{
+    std::vector<uint64_t> wavesPerSe;
+    std::vector<int64_t> waveDurations;
+    size_t wavesWithStates = 0;
+    size_t unknownTokens = 0;
+    size_t desyncs = 0;
+    size_t unterminatedWaves = 0;
+    size_t slicesOutsideWaves = 0;
+};
+
+static void PrintSqttStats( const SqttDecodeStats& stats, size_t totalSlices )
+{
+    printf( "SQTT stats:\n" );
+    for( size_t se = 0; se < stats.wavesPerSe.size(); se++ )
+    {
+        printf( "  SE %zu waves: %llu\n", se, (unsigned long long)stats.wavesPerSe[se] );
+    }
+
+    if( !stats.waveDurations.empty() )
+    {
+        auto durations = stats.waveDurations;
+        std::sort( durations.begin(), durations.end() );
+        const size_t count = durations.size();
+        const int64_t median = count % 2 ? durations[count / 2] : durations[count / 2 - 1] + ( durations[count / 2] - durations[count / 2 - 1] ) / 2;
+        const size_t p99 = ( count * 99 + 99 ) / 100 - 1;
+        printf( "  wave duration ns (min/median/p99/max): %lld/%lld/%lld/%lld\n",
+            (long long)durations.front(), (long long)median, (long long)durations[p99], (long long)durations.back() );
+    }
+    else
+    {
+        printf( "  wave duration ns (min/median/p99/max): unavailable\n" );
+    }
+
+    printf( "  waves with stateCount > 0: %zu/%zu; total slices: %zu; slices outside wave: ",
+        stats.wavesWithStates, stats.waveDurations.size(), totalSlices );
+    if( stats.wavesWithStates == 0 ) printf( "unattributed\n" );
+    else printf( "%zu\n", stats.slicesOutsideWaves );
+    printf( "  unknown tokens: %zu; desyncs: %zu; unterminated waves: %zu\n",
+        stats.unknownTokens, stats.desyncs, stats.unterminatedWaves );
 }
 
 static const char* GetQueueTypeName( uint8_t qtype )
@@ -528,10 +570,17 @@ int main( int argc, char** argv )
 
     tracy::FileCompression clev = tracy::FileCompression::Fast;
 
-    if( argc != 3 ) Usage();
+    bool printStats = false;
+    int arg = 1;
+    if( argc > arg && strcmp( argv[arg], "--stats" ) == 0 )
+    {
+        printStats = true;
+        arg++;
+    }
+    if( argc != arg + 2 ) Usage();
 
-    const char* input = argv[1];
-    const char* output = argv[2];
+    const char* input = argv[arg];
+    const char* output = argv[arg + 1];
 
     printf( "Loading RGP trace: %s\n", input );
     fflush( stdout );
@@ -930,6 +979,9 @@ int main( int argc, char** argv )
     };
     std::unordered_map<uint64_t, ActiveWave> activeWaveMap;
 
+    SqttDecodeStats sqttStats;
+    sqttStats.wavesPerSe.resize( std::max( shaderEngines, 0 ) );
+
     size_t totalDecodedWaves = 0;
 
     for( const auto& streamPair : sqttStreams )
@@ -955,6 +1007,12 @@ int main( int argc, char** argv )
 
             const uint8_t b8 = window & 0xFF;
             const auto& info = s_tokenTable[b8];
+
+            if( info.type == TOKEN_UNKNOWN )
+            {
+                sqttStats.unknownTokens++;
+                sqttStats.desyncs++;
+            }
 
             if( info.token_len == 0 )
             {
@@ -1012,6 +1070,12 @@ int main( int argc, char** argv )
                         wf.stateCount = it->second.stateCount;
 
                         gpuCUs[cuId].simds[simd].slots[wid].waves.push_back( wf );
+                        if( seIdx >= 0 && static_cast<size_t>( seIdx ) < sqttStats.wavesPerSe.size() )
+                        {
+                            sqttStats.wavesPerSe[seIdx]++;
+                        }
+                        sqttStats.waveDurations.push_back( durNs );
+                        if( wf.stateCount > 0 ) sqttStats.wavesWithStates++;
                         it->second.active = false;
                         totalDecodedWaves++;
                     }
@@ -1052,9 +1116,19 @@ int main( int argc, char** argv )
 
             bitpos += info.token_len;
         }
+
+        for( const auto& active : activeWaveMap )
+        {
+            const int cuId = static_cast<int>( active.first >> 16 );
+            if( active.second.active && cuId >= seIdx * cuPerSe && cuId < ( seIdx + 1 ) * cuPerSe )
+            {
+                sqttStats.unterminatedWaves++;
+            }
+        }
     }
 
     printf( "Decoded %zu concurrent wavefronts across %d Compute Units.\n", totalDecodedWaves, totalCUs );
+    if( printStats ) PrintSqttStats( sqttStats, gpuWaveStates.size() );
 
     // Process Shader Code Objects (Disassembly & Stats)
     struct TempShader
