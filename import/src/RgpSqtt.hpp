@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -78,6 +79,8 @@ WaveTokenFields GetWaveStartFields( SqttArch arch, uint64_t window );
 WaveTokenFields GetWaveEndFields( SqttArch arch, uint64_t window );
 uint8_t GetInstOpCode( SqttArch arch, uint64_t window );
 uint64_t GetTokenTimeDelta( SqttArch arch, const SqttToken& token );
+bool MergePartialTimestamp( uint64_t partialTimestamp, uint64_t currentTimestamp, uint64_t timestampMask,
+    uint64_t maximumForwardDelta, uint64_t& mergedTimestamp );
 bool GetRealtimeTimestamp( SqttArch arch, const SqttToken& token, uint64_t& timestamp );
 uint8_t GetInstWaveId( SqttArch arch, SqttTokenType type, uint64_t window );
 uint32_t NormalizeCommandBufferId( uint32_t encodedId );
@@ -111,6 +114,8 @@ struct SqttMarker
     uint32_t apiType;
     uint32_t userEventType;
     uint64_t pipelineHash;
+    std::array<uint32_t, 4> apiArgs;
+    bool hasApiArgs;
     std::string userEventName;
 };
 

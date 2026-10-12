@@ -138,6 +138,9 @@ static bool TestArchTokens()
     SqttToken token {};
     ok &= Check( !ReadToken( SqttArch::Gfx11, truncated.data(), truncated.size(), 0, token ), "reject truncated GFX11 instruction token" );
     ok &= Check( GetTokenEncoding( SqttArch::Gfx12, 0x06 ).token_len == 56, "select GFX12 token table" );
+    ok &= Check( GetTokenEncoding( SqttArch::Gfx11, 0x07 ).type == SqttTokenType::TOKEN_NOP &&
+        GetTokenEncoding( SqttArch::Gfx11, 0x47 ).token_len == 4,
+        "decode unassigned GFX11 prefixes as four-bit NOPs" );
 
     const uint64_t gfx11Start = 0x0C | ( uint64_t( 1 ) << 7 ) | ( uint64_t( 2 ) << 8 ) |
         ( uint64_t( 5 ) << 10 ) | ( uint64_t( 0x13 ) << 13 );
@@ -211,6 +214,16 @@ static bool TestTimeDeltaSemantics()
         "zero GFX11 realtime marker delta" );
     ok &= Check( GetTokenTimeDelta( SqttArch::Gfx11, gfx11Realtime ) == gfx11Delta,
         "keep GFX11 realtime packet delta when PL is set" );
+    constexpr uint64_t gfx11TimestampMask = ( uint64_t( 1 ) << 36 ) - 1;
+    const uint64_t gfx11BaseTimestamp = ( uint64_t( 30 ) << 36 ) | 57232400000;
+    uint64_t mergedTimestamp = 0;
+    ok &= Check( MergePartialTimestamp( 57232400200, gfx11BaseTimestamp, gfx11TimestampMask, 1000000, mergedTimestamp ) &&
+        mergedTimestamp == gfx11BaseTimestamp + 200, "merge GFX11 partial timestamp into the running counter" );
+    const uint64_t gfx11BeforeWrap = ( uint64_t( 30 ) << 36 ) | ( ( uint64_t( 1 ) << 36 ) - 32 );
+    ok &= Check( MergePartialTimestamp( 0x24, gfx11BeforeWrap, gfx11TimestampMask, 100, mergedTimestamp ) &&
+        mergedTimestamp == gfx11BeforeWrap + 0x44, "extend a valid GFX11 timestamp rollover" );
+    ok &= Check( !MergePartialTimestamp( 1344832336, gfx11BaseTimestamp, gfx11TimestampMask, 1000000, mergedTimestamp ),
+        "reject a partial timestamp that resembles an implausible counter rollover" );
     uint64_t realtimeTimestamp = 0;
     ok &= Check( GetRealtimeTimestamp( SqttArch::Gfx11, gfx11Marker, realtimeTimestamp ) && realtimeTimestamp == gfx11Delta,
         "extract GFX11 realtime correlation point" );
@@ -337,9 +350,10 @@ static bool TestMarkers()
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, static_cast<uint32_t>( pipelineHash ), 21 );
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, static_cast<uint32_t>( pipelineHash >> 32 ), 22 );
 
-    AddWord( words, SQ_THREAD_TRACE_USERDATA_2, MARKER_EVENT | ( 2u << 4 ) | ( 6u << 7 ), 30 );
+    AddWord( words, SQ_THREAD_TRACE_USERDATA_2, MARKER_EVENT | ( 3u << 4 ) | ( 6u << 7 ), 30 );
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, encodedCbId, 31 );
-    AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 0xAABBCCDD, 32 );
+    AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 4, 32 );
+    AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 1, 33 );
 
     AddWord( words, SQ_THREAD_TRACE_USERDATA_2, MARKER_BARRIER_START | ( 1u << 4 ) | ( encodedCbId << 7 ), 40 );
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 0x1234, 41 );
@@ -375,6 +389,8 @@ static bool TestMarkers()
     ok &= Check( decoded.markers[2].identifier == MARKER_EVENT && decoded.markers[2].cbId == cbId &&
         decoded.markers[2].apiType == 6 && decoded.markers[2].pipelineHash == pipelineHash,
         "decode event and associated pipeline" );
+    ok &= Check( decoded.markers[2].hasApiArgs && decoded.markers[2].apiArgs == std::array<uint32_t, 4> { 4, 1, 0, 0 },
+        "decode event command arguments" );
     ok &= Check( decoded.markers[3].identifier == MARKER_BARRIER_START && decoded.markers[3].cbId == cbId,
         "decode barrier start" );
     ok &= Check( decoded.markers[4].identifier == MARKER_BARRIER_END && decoded.markers[4].cbId == cbId,

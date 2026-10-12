@@ -107,7 +107,7 @@ template<size_t N>
 std::array<TokenEncoding, 256> BuildTokenTable( const TokenPattern ( &encodings )[N] )
 {
     std::array<TokenEncoding, 256> result {};
-    result.fill( TokenEncoding { SqttTokenType::TOKEN_UNKNOWN, 4, 0, 0 } );
+    result.fill( TokenEncoding { SqttTokenType::TOKEN_NOP, 4, 0, 0 } );
     for( const auto& encoding : encodings )
     {
         const int step = 1 << encoding.pattern_len;
@@ -273,6 +273,21 @@ uint64_t GetTokenTimeDelta( SqttArch arch, const SqttToken& token )
     return delta + ( token.encoding.type == SqttTokenType::TOKEN_TIME ? 4 : 0 );
 }
 
+bool MergePartialTimestamp( uint64_t partialTimestamp, uint64_t currentTimestamp, uint64_t timestampMask,
+    uint64_t maximumForwardDelta, uint64_t& mergedTimestamp )
+{
+    if( partialTimestamp > timestampMask || timestampMask == UINT64_MAX ) return false;
+
+    const uint64_t modulus = timestampMask + 1;
+    const uint64_t previousPartial = currentTimestamp & timestampMask;
+    const uint64_t delta = partialTimestamp >= previousPartial ? partialTimestamp - previousPartial :
+        modulus - previousPartial + partialTimestamp;
+    if( delta > maximumForwardDelta || currentTimestamp > UINT64_MAX - delta ) return false;
+
+    mergedTimestamp = currentTimestamp + delta;
+    return true;
+}
+
 bool GetRealtimeTimestamp( SqttArch arch, const SqttToken& token, uint64_t& timestamp )
 {
     if( token.encoding.type != SqttTokenType::TOKEN_TIMESTAMP ) return false;
@@ -343,7 +358,8 @@ MarkerDecodeResult DecodeMarkers( SqttArch arch, const std::vector<UserdataWord>
         {
         case MARKER_CB_START: wordCount = 4; break;
         case MARKER_CB_END: wordCount = 3; break;
-        case MARKER_EVENT: wordCount = ( ( header >> 31 ) & 1 ) ? 6 : 3; break;
+        case MARKER_EVENT: wordCount = ( ( header >> 31 ) & 1 ) ? 6 :
+            (std::max)( size_t( 3 ), size_t( 1 ) + ( ( header >> 4 ) & 0x7 ) ); break;
         case MARKER_BARRIER_START:
         case MARKER_BARRIER_END:
         case MARKER_LAYOUT_TRANSITION: wordCount = 2; break;
@@ -410,6 +426,12 @@ MarkerDecodeResult DecodeMarkers( SqttArch arch, const std::vector<UserdataWord>
             marker.rawCbId = words[wordIndex + 1].value & 0xFFFFF;
             marker.cbId = NormalizeCommandBufferId( marker.rawCbId );
             marker.pipelineHash = pipelineByCb[marker.cbId];
+            if( wordCount > 3 )
+            {
+                const size_t apiArgCount = (std::min)( marker.apiArgs.size(), wordCount - 2 );
+                for( size_t i = 0; i < apiArgCount; i++ ) marker.apiArgs[i] = words[wordIndex + 2 + i].value;
+                marker.hasApiArgs = true;
+            }
             break;
         case MARKER_GENERAL_API:
             marker.apiType = ( header >> 7 ) & 0xFFFFF;
