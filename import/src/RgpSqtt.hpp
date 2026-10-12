@@ -77,6 +77,7 @@ uint16_t GetGfx10RegAddress( uint64_t window );
 WaveTokenFields GetWaveStartFields( SqttArch arch, uint64_t window );
 WaveTokenFields GetWaveEndFields( SqttArch arch, uint64_t window );
 uint8_t GetInstOpCode( SqttArch arch, uint64_t window );
+uint32_t NormalizeCommandBufferId( uint32_t encodedId );
 
 inline constexpr uint16_t SQ_THREAD_TRACE_USERDATA_2 = 0x342;
 inline constexpr uint16_t SQ_THREAD_TRACE_USERDATA_3 = 0x343;
@@ -103,6 +104,7 @@ struct SqttMarker
     uint64_t shaderTimestamp;
     uint8_t identifier;
     uint32_t cbId;
+    uint32_t rawCbId;
     uint32_t apiType;
     uint32_t userEventType;
     uint64_t pipelineHash;

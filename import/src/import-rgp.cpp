@@ -8,6 +8,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <map>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -259,17 +260,6 @@ static bool Gfx10CuLocation( int se, int shaderEngines, int cuPerSe, int shaderA
 
     cuId = se * cuPerSe + sa * cusPerSa + wgp * cusPerWgp + simd / simdsPerCu;
     simdInCu = simd % simdsPerCu;
-    return true;
-}
-
-template<typename ActiveCommandBuffers>
-static bool ResolveBindCommandBufferId( uint32_t cbId, const ActiveCommandBuffers& activeCommandBuffers, uint32_t& resolvedId )
-{
-    const bool exactMatch = activeCommandBuffers.count( cbId ) != 0;
-    const uint32_t doubledId = cbId <= UINT32_MAX / 2 ? cbId * 2 : 0;
-    const bool doubledMatch = doubledId != 0 && activeCommandBuffers.count( doubledId ) != 0;
-    if( exactMatch == doubledMatch ) return false;
-    resolvedId = exactMatch ? cbId : doubledId;
     return true;
 }
 
@@ -1716,6 +1706,47 @@ int main( int argc, char** argv )
         const auto& streamPoints = streamRealtimePoints[selectedMarkerStream];
         selectedMarkerCount = decoded.markers.size();
         markerDecodeErrors = decoded.errors;
+        static constexpr std::array<const char*, 6> markerNames = {
+            "CB_START", "CB_END", "BARRIER_START", "BARRIER_END", "EVENT", "BIND_PIPELINE"
+        };
+        static constexpr std::array<uint8_t, 6> markerIds = {
+            MARKER_CB_START, MARKER_CB_END, MARKER_BARRIER_START, MARKER_BARRIER_END, MARKER_EVENT, MARKER_BIND_PIPELINE
+        };
+        for( size_t streamIndex = 0; streamIndex < markerStreams.size(); streamIndex++ )
+        {
+            std::array<std::map<uint32_t, size_t>, markerIds.size()> rawCbIds;
+            for( const auto& marker : markerStreams[streamIndex].markers )
+            {
+                const auto markerType = std::find( markerIds.begin(), markerIds.end(), marker.identifier );
+                if( markerType != markerIds.end() )
+                {
+                    const size_t markerIndex = static_cast<size_t>( markerType - markerIds.begin() );
+                    rawCbIds[markerIndex][marker.rawCbId]++;
+                }
+            }
+            printf( "  SE %d raw marker CB IDs:", sqttStreams[streamIndex].first.shader_engine_index );
+            for( size_t markerIndex = 0; markerIndex < rawCbIds.size(); markerIndex++ )
+            {
+                if( rawCbIds[markerIndex].empty() ) continue;
+                printf( " %s", markerNames[markerIndex] );
+                for( const auto& [rawId, count] : rawCbIds[markerIndex] )
+                {
+                    const uint32_t cbId = markerIds[markerIndex] == MARKER_BIND_PIPELINE ? rawId :
+                        rgp_sqtt::NormalizeCommandBufferId( rawId );
+                    printf( " 0x%05X->%u(%zu)", rawId, cbId, count );
+                }
+            }
+            printf( "\n" );
+        }
+        std::map<uint32_t, size_t> queueCbIds;
+        for( const auto& event : queueEvents )
+        {
+            if( event.event_type == SQTT_QUEUE_TIMING_EVENT_CMDBUF_SUBMIT ) queueCbIds[event.sqtt_cb_id]++;
+        }
+        printf( "  Queue submit CB IDs (plain):" );
+        for( const auto& [cbId, count] : queueCbIds ) printf( " %u(%zu)", cbId, count );
+        printf( "\n" );
+
         selectedMarkerSe = sqttStreams[selectedMarkerStream].first.shader_engine_index;
         auto FindSubmitSpan = [&]( uint32_t cbId, int64_t time ) -> const SubmitSpan* {
             const SubmitSpan* match = nullptr;
@@ -1802,9 +1833,7 @@ int main( int argc, char** argv )
             else if( marker.identifier == MARKER_CB_END ) boundPipelinesByCb.erase( marker.cbId );
             else if( marker.identifier == MARKER_BIND_PIPELINE )
             {
-                uint32_t bindCbId;
-                if( ResolveBindCommandBufferId( marker.cbId, commandBufferSpans, bindCbId ) )
-                    boundPipelinesByCb[bindCbId] = marker.pipelineHash;
+                boundPipelinesByCb[marker.cbId] = marker.pipelineHash;
                 continue;
             }
             if( marker.identifier == MARKER_CB_START )
@@ -2082,9 +2111,7 @@ int main( int argc, char** argv )
                 }
                 else if( marker.identifier == MARKER_BIND_PIPELINE )
                 {
-                    uint32_t bindCbId;
-                    if( ResolveBindCommandBufferId( marker.cbId, activeCommandBuffers, bindCbId ) )
-                        commandBufferPipelines[bindCbId] = marker.pipelineHash;
+                    commandBufferPipelines[marker.cbId] = marker.pipelineHash;
                 }
             }
 

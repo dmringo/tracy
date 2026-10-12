@@ -176,6 +176,21 @@ static bool TestArchTokens()
     return ok;
 }
 
+static bool TestCommandBufferIdNormalization()
+{
+    constexpr uint32_t globalCbIndex = 0x12345;
+    constexpr uint32_t globalEncodedId = globalCbIndex << 1;
+    constexpr uint32_t frameIndex = 0x35;
+    constexpr uint32_t frameCbIndex = 0xABC;
+    constexpr uint32_t frameEncodedId = ( frameCbIndex << 8 ) | ( frameIndex << 1 ) | 1;
+    bool ok = true;
+    ok &= Check( NormalizeCommandBufferId( globalEncodedId ) == globalCbIndex,
+        "decode global command-buffer union index" );
+    ok &= Check( NormalizeCommandBufferId( frameEncodedId ) == frameCbIndex,
+        "decode per-frame command-buffer union index" );
+    return ok;
+}
+
 struct ExpectedTokenCount
 {
     SqttTokenType type;
@@ -245,10 +260,11 @@ static bool TestReferenceCaptures()
 static bool TestMarkers()
 {
     constexpr uint32_t cbId = 0x12345;
+    constexpr uint32_t encodedCbId = cbId << 1;
     constexpr uint64_t pipelineHash = 0x1122334455667788ull;
     std::vector<UserdataWord> words;
 
-    AddWord( words, SQ_THREAD_TRACE_USERDATA_2, MARKER_CB_START | ( 3u << 4 ) | ( cbId << 7 ), 10 );
+    AddWord( words, SQ_THREAD_TRACE_USERDATA_2, MARKER_CB_START | ( 3u << 4 ) | ( encodedCbId << 7 ), 10 );
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 0x11111111, 11 );
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 0x22222222, 12 );
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 0x33333333, 13 );
@@ -258,19 +274,19 @@ static bool TestMarkers()
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, static_cast<uint32_t>( pipelineHash >> 32 ), 22 );
 
     AddWord( words, SQ_THREAD_TRACE_USERDATA_2, MARKER_EVENT | ( 2u << 4 ) | ( 6u << 7 ), 30 );
-    AddWord( words, SQ_THREAD_TRACE_USERDATA_3, cbId, 31 );
+    AddWord( words, SQ_THREAD_TRACE_USERDATA_3, encodedCbId, 31 );
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 0xAABBCCDD, 32 );
 
-    AddWord( words, SQ_THREAD_TRACE_USERDATA_2, MARKER_BARRIER_START | ( 1u << 4 ) | ( cbId << 7 ), 40 );
+    AddWord( words, SQ_THREAD_TRACE_USERDATA_2, MARKER_BARRIER_START | ( 1u << 4 ) | ( encodedCbId << 7 ), 40 );
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 0x1234, 41 );
-    AddWord( words, SQ_THREAD_TRACE_USERDATA_2, MARKER_BARRIER_END | ( 1u << 4 ) | ( cbId << 7 ), 50 );
+    AddWord( words, SQ_THREAD_TRACE_USERDATA_2, MARKER_BARRIER_END | ( 1u << 4 ) | ( encodedCbId << 7 ), 50 );
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 0x5678, 51 );
 
     AddWord( words, SQ_THREAD_TRACE_USERDATA_2, MARKER_USER_EVENT | ( 2u << 12 ), 60 );
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 4, 61 );
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 0x6B726F57, 62 );
 
-    AddWord( words, SQ_THREAD_TRACE_USERDATA_2, MARKER_CB_END | ( 2u << 4 ) | ( cbId << 7 ), 70 );
+    AddWord( words, SQ_THREAD_TRACE_USERDATA_2, MARKER_CB_END | ( 2u << 4 ) | ( encodedCbId << 7 ), 70 );
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 0x44444444, 71 );
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 0x55555555, 72 );
 
@@ -288,6 +304,8 @@ static bool TestMarkers()
 
     ok &= Check( decoded.markers[0].identifier == MARKER_CB_START && decoded.markers[0].cbId == cbId,
         "decode command-buffer start" );
+    ok &= Check( decoded.markers[0].rawCbId == encodedCbId && decoded.markers[1].rawCbId == cbId,
+        "retain raw union and plain bind command-buffer IDs" );
     ok &= Check( decoded.markers[1].identifier == MARKER_BIND_PIPELINE && decoded.markers[1].cbId == cbId &&
         decoded.markers[1].pipelineHash == pipelineHash, "decode 64-bit pipeline hash" );
     ok &= Check( decoded.markers[2].identifier == MARKER_EVENT && decoded.markers[2].cbId == cbId &&
@@ -324,6 +342,7 @@ static bool TestMalformedMarkers()
 
 int main()
 {
-    const bool ok = TestTokens() & TestArchTokens() & TestReferenceCaptures() & TestMarkers() & TestMalformedMarkers();
+    const bool ok = TestTokens() & TestArchTokens() & TestCommandBufferIdNormalization() & TestReferenceCaptures() &
+        TestMarkers() & TestMalformedMarkers();
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

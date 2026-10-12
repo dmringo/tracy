@@ -253,6 +253,11 @@ uint8_t GetInstOpCode( SqttArch arch, uint64_t window )
     return static_cast<uint8_t>( ( window >> ( arch == SqttArch::Gfx12 ? 12 : 13 ) ) & ( arch == SqttArch::Gfx12 ? 0xFF : 0x7F ) );
 }
 
+uint32_t NormalizeCommandBufferId( uint32_t encodedId )
+{
+    return ( encodedId & 1 ) ? ( encodedId >> 8 ) & 0xFFF : ( encodedId >> 1 ) & 0x7FFFF;
+}
+
 MarkerDecodeResult DecodeMarkers( const std::vector<UserdataWord>& words )
 {
     return DecodeMarkers( SqttArch::Gfx10, words );
@@ -269,6 +274,7 @@ MarkerDecodeResult DecodeMarkers( SqttArch arch, const std::vector<UserdataWord>
     const auto& addresses = markerAddresses[archIndex < markerAddresses.size() ? archIndex : 0];
     MarkerDecodeResult result;
     uint32_t currentCbId = 0;
+    uint32_t currentRawCbId = 0;
     std::unordered_map<uint32_t, uint64_t> pipelineByCb;
     size_t wordIndex = 0;
     while( wordIndex < words.size() )
@@ -340,21 +346,26 @@ MarkerDecodeResult DecodeMarkers( SqttArch arch, const std::vector<UserdataWord>
         marker.identifier = identifier;
         marker.userEventType = userEventType;
         marker.cbId = currentCbId;
+        marker.rawCbId = currentRawCbId;
 
         switch( identifier )
         {
         case MARKER_CB_START:
-            marker.cbId = ( header >> 7 ) & 0xFFFFF;
+            marker.rawCbId = ( header >> 7 ) & 0xFFFFF;
+            marker.cbId = NormalizeCommandBufferId( marker.rawCbId );
             currentCbId = marker.cbId;
+            currentRawCbId = marker.rawCbId;
             break;
         case MARKER_CB_END:
         case MARKER_BARRIER_START:
         case MARKER_BARRIER_END:
-            marker.cbId = ( header >> 7 ) & 0xFFFFF;
+            marker.rawCbId = ( header >> 7 ) & 0xFFFFF;
+            marker.cbId = NormalizeCommandBufferId( marker.rawCbId );
             break;
         case MARKER_EVENT:
             marker.apiType = ( header >> 7 ) & 0xFFFFFF;
-            marker.cbId = words[wordIndex + 1].value & 0xFFFFF;
+            marker.rawCbId = words[wordIndex + 1].value & 0xFFFFF;
+            marker.cbId = NormalizeCommandBufferId( marker.rawCbId );
             marker.pipelineHash = pipelineByCb[marker.cbId];
             break;
         case MARKER_GENERAL_API:
@@ -362,7 +373,8 @@ MarkerDecodeResult DecodeMarkers( SqttArch arch, const std::vector<UserdataWord>
             marker.pipelineHash = pipelineByCb[marker.cbId];
             break;
         case MARKER_BIND_PIPELINE:
-            marker.cbId = ( header >> 9 ) & 0xFFFFF;
+            marker.rawCbId = ( header >> 9 ) & 0xFFFFF;
+            marker.cbId = marker.rawCbId;
             marker.pipelineHash = uint64_t( words[wordIndex + 1].value ) |
                 ( uint64_t( words[wordIndex + 2].value ) << 32 );
             pipelineByCb[marker.cbId] = marker.pipelineHash;
@@ -385,7 +397,11 @@ MarkerDecodeResult DecodeMarkers( SqttArch arch, const std::vector<UserdataWord>
         }
 
         result.markers.push_back( std::move( marker ) );
-        if( identifier == MARKER_CB_END ) currentCbId = 0;
+        if( identifier == MARKER_CB_END )
+        {
+            currentCbId = 0;
+            currentRawCbId = 0;
+        }
         wordIndex += wordCount;
     }
     return result;

@@ -1,3 +1,7 @@
+param(
+    [string]$ImporterPath
+)
+
 $ErrorActionPreference = 'Stop'
 
 function Invoke-CapturedProcess
@@ -40,7 +44,11 @@ function Invoke-CapturedProcess
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $testRoot = Join-Path $root 'test_rgp'
 $sampleRoot = Join-Path $testRoot 'samples'
-$importer = Join-Path $root 'import\build-msvc\tracy-import-rgp.exe'
+$importer = if( [string]::IsNullOrWhiteSpace( $ImporterPath ) ) {
+    Join-Path $root 'import\build-msvc\tracy-import-rgp.exe'
+} else {
+    (Resolve-Path -LiteralPath $ImporterPath).Path
+}
 $csvexport = Join-Path $root 'csvexport\build-msvc\tracy-csvexport.exe'
 $expectedPath = Join-Path $testRoot 'expected_stats.json'
 
