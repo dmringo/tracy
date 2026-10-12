@@ -1,7 +1,10 @@
 #include "../src/RgpSqtt.hpp"
+#include "data/RgpSqttReferenceData.hpp"
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <vector>
 
 using namespace tracy::rgp_sqtt;
@@ -66,6 +69,176 @@ static bool TestTokens()
     ok &= Check( ReadGfx10Token( garbage, sizeof( garbage ), 0, token ), "read unknown token prefix safely" );
     ok &= Check( token.encoding.type == SqttTokenType::TOKEN_UNKNOWN, "classify garbage prefix as unknown" );
     ok &= Check( !ReadGfx10Token( nullptr, 0, 0, token ), "reject null token input" );
+
+    for( unsigned int prefix = 0; prefix < 256; prefix++ )
+    {
+        const auto legacyEncoding = GetGfx10TokenEncoding( static_cast<uint8_t>( prefix ) );
+        const auto archEncoding = GetTokenEncoding( SqttArch::Gfx10, static_cast<uint8_t>( prefix ) );
+        ok &= Check( archEncoding.type == legacyEncoding.type && archEncoding.token_len == legacyEncoding.token_len &&
+            archEncoding.time_begin == legacyEncoding.time_begin && archEncoding.time_end == legacyEncoding.time_end,
+            "preserve GFX10 token encoding through architecture API" );
+
+        auto bytes = MakeToken( static_cast<uint8_t>( prefix ), legacyEncoding.token_len );
+        SqttToken legacyToken {};
+        SqttToken archToken {};
+        const bool legacyRead = ReadGfx10Token( bytes.data(), bytes.size(), 0, legacyToken );
+        const bool archRead = ReadToken( SqttArch::Gfx10, bytes.data(), bytes.size(), 0, archToken );
+        ok &= Check( archRead == legacyRead, "preserve GFX10 token read result through architecture API" );
+        if( legacyRead && archRead )
+        {
+            ok &= Check( archToken.window == legacyToken.window && archToken.encoding.type == legacyToken.encoding.type &&
+                archToken.encoding.token_len == legacyToken.encoding.token_len &&
+                archToken.encoding.time_begin == legacyToken.encoding.time_begin &&
+                archToken.encoding.time_end == legacyToken.encoding.time_end,
+                "preserve GFX10 decoded token through architecture API" );
+        }
+    }
+    return ok;
+}
+
+static bool TestArchTokens()
+{
+    bool ok = true;
+    const struct
+    {
+        SqttArch arch;
+        uint8_t prefix;
+        SqttTokenType type;
+        uint8_t length;
+    } cases[] = {
+        { SqttArch::Gfx11, 0x02, SqttTokenType::TOKEN_INST, 20 },
+        { SqttArch::Gfx11, 0x0E, SqttTokenType::TOKEN_ALU_EXEC, 8 },
+        { SqttArch::Gfx11, 0x0F, SqttTokenType::TOKEN_VMEM_EXEC, 8 },
+        { SqttArch::Gfx11, 0x04, SqttTokenType::TOKEN_IMMED, 24 },
+        { SqttArch::Gfx11, 0x21, SqttTokenType::TOKEN_NEW_PC, 72 },
+        { SqttArch::Gfx11, 0x1C, SqttTokenType::TOKEN_SHADER_DATA_SHORT, 48 },
+        { SqttArch::Gfx11, 0x05, SqttTokenType::TOKEN_WAVE_ALLOC, 20 },
+        { SqttArch::Gfx11, 0x06, SqttTokenType::TOKEN_SHADER_DATA, 52 },
+        { SqttArch::Gfx11, 0x16, SqttTokenType::TOKEN_PERF, 28 },
+        { SqttArch::Gfx11, 0x01, SqttTokenType::TOKEN_TIMESTAMP, 48 },
+        { SqttArch::Gfx12, 0x02, SqttTokenType::TOKEN_INST, 20 },
+        { SqttArch::Gfx12, 0x1C, SqttTokenType::TOKEN_SHADER_DATA_SHORT, 40 },
+        { SqttArch::Gfx12, 0x05, SqttTokenType::TOKEN_WAVE_ALLOC, 24 },
+        { SqttArch::Gfx12, 0x06, SqttTokenType::TOKEN_SHADER_DATA, 56 },
+        { SqttArch::Gfx12, 0x16, SqttTokenType::TOKEN_PERF, 32 },
+        { SqttArch::Gfx12, 0x01, SqttTokenType::TOKEN_TIMESTAMP, 64 },
+        { SqttArch::Gfx12, 0x09, SqttTokenType::TOKEN_REG, 64 },
+    };
+
+    for( const auto& test : cases )
+    {
+        auto bytes = MakeToken( test.prefix, test.length );
+        SqttToken token {};
+        ok &= Check( ReadToken( test.arch, bytes.data(), bytes.size(), 0, token ), "read complete architecture token" );
+        ok &= Check( token.encoding.type == test.type, "classify architecture token prefix" );
+        ok &= Check( token.encoding.token_len == test.length, "report architecture token length" );
+    }
+
+    auto truncated = MakeToken( 0x02, 16 );
+    SqttToken token {};
+    ok &= Check( !ReadToken( SqttArch::Gfx11, truncated.data(), truncated.size(), 0, token ), "reject truncated GFX11 instruction token" );
+    ok &= Check( GetTokenEncoding( SqttArch::Gfx12, 0x06 ).token_len == 56, "select GFX12 token table" );
+
+    const uint64_t gfx11Start = 0x0C | ( uint64_t( 1 ) << 7 ) | ( uint64_t( 2 ) << 8 ) |
+        ( uint64_t( 5 ) << 10 ) | ( uint64_t( 0x13 ) << 13 );
+    const auto gfx10StartFields = GetWaveStartFields( SqttArch::Gfx10, gfx11Start );
+    const auto gfx11StartFields = GetWaveStartFields( SqttArch::Gfx11, gfx11Start );
+    ok &= Check( gfx10StartFields.sa == 1 && gfx10StartFields.simd == 2 && gfx10StartFields.wgp == 5 &&
+        gfx10StartFields.wave == 0x13, "extract GFX10 wave-start fields" );
+    ok &= Check( gfx11StartFields.sa == 1 && gfx11StartFields.simd == 2 && gfx11StartFields.wgp == 5 &&
+        gfx11StartFields.wave == 0x13, "extract GFX11 wave-start fields" );
+
+    const uint64_t gfx11End = 0x15 | ( uint64_t( 1 ) << 8 ) | ( uint64_t( 3 ) << 9 ) |
+        ( uint64_t( 6 ) << 11 ) | ( uint64_t( 0x1B ) << 15 );
+    const auto gfx11EndFields = GetWaveEndFields( SqttArch::Gfx11, gfx11End );
+    ok &= Check( gfx11EndFields.sa == 1 && gfx11EndFields.simd == 3 && gfx11EndFields.wgp == 6 &&
+        gfx11EndFields.wave == 0x1B, "extract GFX11 wave-end fields" );
+
+    const uint64_t gfx12Start = 0x0C | ( uint64_t( 1 ) << 7 ) | ( uint64_t( 3 ) << 8 ) |
+        ( uint64_t( 0xD ) << 10 ) | ( uint64_t( 0x1A ) << 15 );
+    const auto gfx12StartFields = GetWaveStartFields( SqttArch::Gfx12, gfx12Start );
+    ok &= Check( gfx12StartFields.sa == 1 && gfx12StartFields.simd == 3 && gfx12StartFields.wgp == 0xD &&
+        gfx12StartFields.wave == 0x1A, "extract four-bit GFX12 wave-start WGP" );
+
+    const uint64_t gfx12End = 0x15 | ( uint64_t( 1 ) << 8 ) | ( uint64_t( 2 ) << 9 ) |
+        ( uint64_t( 0xE ) << 11 ) | ( uint64_t( 0x1D ) << 15 );
+    const auto gfx12EndFields = GetWaveEndFields( SqttArch::Gfx12, gfx12End );
+    ok &= Check( gfx12EndFields.sa == 1 && gfx12EndFields.simd == 2 && gfx12EndFields.wgp == 0xE &&
+        gfx12EndFields.wave == 0x1D, "extract four-bit GFX12 wave-end WGP" );
+
+    ok &= Check( GetInstOpCode( SqttArch::Gfx10, uint64_t( 0x53 ) << 13 ) == 0x53, "extract GFX10 INST opcode" );
+    ok &= Check( GetInstOpCode( SqttArch::Gfx11, uint64_t( 0x6A ) << 13 ) == 0x6A, "extract GFX11 INST opcode" );
+    ok &= Check( GetInstOpCode( SqttArch::Gfx12, uint64_t( 0xA5 ) << 12 ) == 0xA5, "extract shifted eight-bit GFX12 INST opcode" );
+
+    constexpr uint64_t regWindow = 0x09 | ( uint64_t( 0xA5B ) << 16 );
+    ok &= Check( GetRegAddress( SqttArch::Gfx11, regWindow ) == 0xA5B, "extract GFX11 REG address at bit 16" );
+    ok &= Check( GetRegAddress( SqttArch::Gfx12, regWindow ) == 0xA5B, "extract GFX12 REG address at bit 16" );
+    return ok;
+}
+
+struct ExpectedTokenCount
+{
+    SqttTokenType type;
+    size_t count;
+};
+
+static bool TestReferenceCapture( SqttArch arch, const uint8_t* data, size_t bytes,
+    std::initializer_list<ExpectedTokenCount> expected )
+{
+    constexpr size_t tokenTypeCount = static_cast<size_t>( SqttTokenType::TOKEN_PERF ) + 1;
+    std::array<size_t, tokenTypeCount> counts {};
+    size_t bitpos = 0;
+    size_t packetCount = 0;
+    bool ok = true;
+    while( bitpos < bytes * 8 )
+    {
+        SqttToken token {};
+        if( !ReadToken( arch, data, bytes, bitpos, token ) ) break;
+        counts[static_cast<size_t>( token.encoding.type )]++;
+        packetCount++;
+        bitpos += token.encoding.token_len;
+    }
+
+    size_t total = 0;
+    for( const auto& test : expected )
+    {
+        const auto count = counts[static_cast<size_t>( test.type )];
+        ok &= Check( count == test.count, "match tinygrad reference packet type count" );
+        total += count;
+    }
+    ok &= Check( total == ( arch == SqttArch::Gfx11 ? 148 : 139 ) && packetCount == total,
+        "match tinygrad reference packet count and types" );
+    ok &= Check( bitpos == bytes * 8, "consume complete tinygrad reference excerpt" );
+    if( !ok )
+    {
+        fprintf( stderr, "GFX%u reference decode: %zu packets, %zu bits\n", static_cast<unsigned>( arch ) + 10,
+            packetCount, bitpos );
+        for( size_t i = 0; i < counts.size(); i++ )
+        {
+            if( counts[i] ) fprintf( stderr, "  token type %zu: %zu\n", i, counts[i] );
+        }
+    }
+    return ok;
+}
+
+static bool TestReferenceCaptures()
+{
+    bool ok = true;
+    ok &= TestReferenceCapture( SqttArch::Gfx11, sqtt_test_data::gfx1100Gemm, 252, {
+        { SqttTokenType::TOKEN_HEADER, 1 },
+        { SqttTokenType::TOKEN_MISC, 16 },
+        { SqttTokenType::TOKEN_REG, 14 },
+        { SqttTokenType::TOKEN_NOP, 106 },
+        { SqttTokenType::TOKEN_TIMESTAMP, 4 },
+        { SqttTokenType::TOKEN_TIME, 7 },
+    } );
+    ok &= TestReferenceCapture( SqttArch::Gfx12, sqtt_test_data::gfx1200Gemm, 187, {
+        { SqttTokenType::TOKEN_HEADER, 1 },
+        { SqttTokenType::TOKEN_TIMESTAMP, 4 },
+        { SqttTokenType::TOKEN_REG, 3 },
+        { SqttTokenType::TOKEN_NOP, 108 },
+        { SqttTokenType::TOKEN_MISC, 23 },
+    } );
     return ok;
 }
 
@@ -102,9 +275,15 @@ static bool TestMarkers()
     AddWord( words, SQ_THREAD_TRACE_USERDATA_3, 0x55555555, 72 );
 
     const auto decoded = DecodeMarkers( words );
+    const auto decodedGfx10 = DecodeMarkers( SqttArch::Gfx10, words );
+    const auto decodedGfx11 = DecodeMarkers( SqttArch::Gfx11, words );
+    const auto decodedGfx12 = DecodeMarkers( SqttArch::Gfx12, words );
     bool ok = true;
     ok &= Check( decoded.errors == 0, "decode valid marker stream without errors" );
     ok &= Check( decoded.markers.size() == 7, "decode command-buffer, pipeline, event, barriers, user event, and end markers" );
+    ok &= Check( decodedGfx10.markers.size() == decoded.markers.size() &&
+        decodedGfx11.markers.size() == decoded.markers.size() && decodedGfx12.markers.size() == decoded.markers.size(),
+        "decode marker stream for all supported architectures" );
     if( decoded.markers.size() != 7 ) return false;
 
     ok &= Check( decoded.markers[0].identifier == MARKER_CB_START && decoded.markers[0].cbId == cbId,
@@ -145,6 +324,6 @@ static bool TestMalformedMarkers()
 
 int main()
 {
-    const bool ok = TestTokens() & TestMarkers() & TestMalformedMarkers();
+    const bool ok = TestTokens() & TestArchTokens() & TestReferenceCaptures() & TestMarkers() & TestMalformedMarkers();
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

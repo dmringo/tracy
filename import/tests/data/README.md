@@ -1,0 +1,5 @@
+# SQTT reference excerpts
+
+`RgpSqttReferenceData.hpp` contains the first 256 bytes of the first `ProfileSQTTEvent.blob` in tinygrad's `profile_gemm_run_0.pkl` examples for `gfx1100` and `gfx1200`. The tests decode the first 252 bytes for GFX11 and the first 187 bytes for GFX12, ending at complete packet boundaries. Tinygrad's Python decoder reports 148 packets for the GFX11 slice (1 layout header, 16 wave-state, 14 REG, 106 NOP, 4 timestamp-delta/marker, 7 short-delta) and 139 packets for the GFX12 slice (1 layout header, 4 timestamp-delta/marker, 3 REG, 108 NOP, 23 wave-state).
+
+Source: [tinygrad SQTT examples](https://github.com/tinygrad/tinygrad/tree/797924c3715f72f907b0a02e14aa327c3b626efc/extra/sqtt/examples). Decoder: [tinygrad `sqtt.py`](https://github.com/tinygrad/tinygrad/blob/797924c3715f72f907b0a02e14aa327c3b626efc/tinygrad/renderer/amd/sqtt.py). The excerpts are from the tinygrad repository, which is licensed under MIT.

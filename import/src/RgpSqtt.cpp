@@ -49,6 +49,76 @@ constexpr TokenPattern gfx10Encodings[] = {
     { SqttTokenType::TOKEN_HEADER, 0b0010001, 7, 64, 0, 0 },
 };
 
+constexpr TokenPattern gfx11Encodings[] = {
+    { SqttTokenType::TOKEN_INST, 0b010, 3, 20, 4, 7 },
+    { SqttTokenType::TOKEN_VALU, 0b011, 3, 12, 3, 6 },
+    { SqttTokenType::TOKEN_IMM_ONE, 0b1101, 4, 12, 4, 7 },
+    { SqttTokenType::TOKEN_ALU_EXEC, 0b1110, 4, 8, 4, 6 },
+    { SqttTokenType::TOKEN_VMEM_EXEC, 0b1111, 4, 8, 4, 6 },
+    { SqttTokenType::TOKEN_IMMED, 0b00100, 5, 24, 5, 8 },
+    { SqttTokenType::TOKEN_WAVE_READY, 0b10100, 5, 24, 5, 8 },
+    { SqttTokenType::TOKEN_WAVE_START, 0b01100, 5, 32, 5, 7 },
+    { SqttTokenType::TOKEN_SHADER_DATA_SHORT, 0b11100, 5, 48, 5, 7 },
+    { SqttTokenType::TOKEN_WAVE_ALLOC, 0b00101, 5, 20, 5, 8 },
+    { SqttTokenType::TOKEN_WAVE_END, 0b10101, 5, 20, 5, 8 },
+    { SqttTokenType::TOKEN_SHADER_DATA, 0b00110, 5, 52, 5, 8 },
+    { SqttTokenType::TOKEN_PERF, 0b10110, 5, 28, 5, 8 },
+    { SqttTokenType::TOKEN_NEW_PC, 0b0100001, 7, 72, 8, 11 },
+    { SqttTokenType::TOKEN_UTIL_COUNTER, 0b0110001, 7, 48, 7, 9 },
+    { SqttTokenType::TOKEN_MISC, 0b1010001, 7, 24, 7, 16 },
+    { SqttTokenType::TOKEN_REG_INIT, 0b1110001, 7, 64, 7, 10 },
+    { SqttTokenType::TOKEN_TIMESTAMP, 0b0000001, 7, 48, 12, 48 },
+    { SqttTokenType::TOKEN_HEADER, 0b0010001, 7, 64, 0, 0 },
+    { SqttTokenType::TOKEN_TIME, 0b1000, 4, 8, 4, 8 },
+    { SqttTokenType::TOKEN_NOP, 0b0000, 4, 4, 0, 0 },
+    { SqttTokenType::TOKEN_EVENT, 0b01100001, 8, 24, 8, 11 },
+    { SqttTokenType::TOKEN_EVENT_SYNC, 0b11100001, 8, 32, 8, 11 },
+    { SqttTokenType::TOKEN_REG, 0b1001, 4, 64, 4, 7 },
+};
+
+constexpr TokenPattern gfx12Encodings[] = {
+    { SqttTokenType::TOKEN_INST, 0b010, 3, 20, 3, 6 },
+    { SqttTokenType::TOKEN_VALU, 0b011, 3, 12, 3, 6 },
+    { SqttTokenType::TOKEN_IMM_ONE, 0b1101, 4, 12, 4, 7 },
+    { SqttTokenType::TOKEN_ALU_EXEC, 0b1110, 4, 8, 4, 6 },
+    { SqttTokenType::TOKEN_VMEM_EXEC, 0b1111, 4, 8, 4, 6 },
+    { SqttTokenType::TOKEN_IMMED, 0b00100, 5, 24, 5, 8 },
+    { SqttTokenType::TOKEN_WAVE_READY, 0b10100, 5, 24, 5, 8 },
+    { SqttTokenType::TOKEN_WAVE_START, 0b01100, 5, 32, 5, 7 },
+    { SqttTokenType::TOKEN_SHADER_DATA_SHORT, 0b11100, 5, 40, 5, 7 },
+    { SqttTokenType::TOKEN_WAVE_ALLOC, 0b00101, 5, 24, 5, 8 },
+    { SqttTokenType::TOKEN_WAVE_END, 0b10101, 5, 20, 5, 8 },
+    { SqttTokenType::TOKEN_SHADER_DATA, 0b00110, 5, 56, 7, 10 },
+    { SqttTokenType::TOKEN_PERF, 0b10110, 5, 32, 7, 10 },
+    { SqttTokenType::TOKEN_NEW_PC, 0b0100001, 7, 72, 8, 11 },
+    { SqttTokenType::TOKEN_UTIL_COUNTER, 0b0110001, 7, 48, 7, 9 },
+    { SqttTokenType::TOKEN_MISC, 0b1010001, 7, 24, 7, 16 },
+    { SqttTokenType::TOKEN_REG_INIT, 0b1110001, 7, 64, 7, 10 },
+    { SqttTokenType::TOKEN_TIMESTAMP, 0b0000001, 7, 64, 12, 64 },
+    { SqttTokenType::TOKEN_HEADER, 0b0010001, 7, 64, 0, 0 },
+    { SqttTokenType::TOKEN_TIME, 0b1000, 4, 8, 4, 8 },
+    { SqttTokenType::TOKEN_NOP, 0b0000, 4, 4, 0, 0 },
+    { SqttTokenType::TOKEN_EVENT, 0b01100001, 8, 24, 8, 11 },
+    { SqttTokenType::TOKEN_EVENT_SYNC, 0b11100001, 8, 32, 8, 11 },
+    { SqttTokenType::TOKEN_REG, 0b1001, 4, 64, 4, 7 },
+};
+
+template<size_t N>
+std::array<TokenEncoding, 256> BuildTokenTable( const TokenPattern ( &encodings )[N] )
+{
+    std::array<TokenEncoding, 256> result {};
+    result.fill( TokenEncoding { SqttTokenType::TOKEN_UNKNOWN, 4, 0, 0 } );
+    for( const auto& encoding : encodings )
+    {
+        const int step = 1 << encoding.pattern_len;
+        for( int prefix = encoding.pattern; prefix < 256; prefix += step )
+        {
+            result[prefix] = TokenEncoding { encoding.type, encoding.token_len, encoding.time_begin, encoding.time_end };
+        }
+    }
+    return result;
+}
+
 const std::array<TokenEncoding, 256>& GetGfx10TokenTable()
 {
     static const auto table = [] {
@@ -67,6 +137,29 @@ const std::array<TokenEncoding, 256>& GetGfx10TokenTable()
     return table;
 }
 
+const std::array<TokenEncoding, 256>& GetGfx11TokenTable()
+{
+    static const auto table = BuildTokenTable( gfx11Encodings );
+    return table;
+}
+
+const std::array<TokenEncoding, 256>& GetGfx12TokenTable()
+{
+    static const auto table = BuildTokenTable( gfx12Encodings );
+    return table;
+}
+
+}
+
+TokenEncoding GetTokenEncoding( SqttArch arch, uint8_t prefix )
+{
+    switch( arch )
+    {
+    case SqttArch::Gfx10: return GetGfx10TokenEncoding( prefix );
+    case SqttArch::Gfx11: return GetGfx11TokenTable()[prefix];
+    case SqttArch::Gfx12: return GetGfx12TokenTable()[prefix];
+    }
+    return TokenEncoding { SqttTokenType::TOKEN_UNKNOWN, 4, 0, 0 };
 }
 
 TokenEncoding GetGfx10TokenEncoding( uint8_t prefix )
@@ -108,20 +201,79 @@ bool ReadGfx10Token( const uint8_t* data, size_t bytes, size_t bitpos, SqttToken
     return true;
 }
 
+bool ReadToken( SqttArch arch, const uint8_t* data, size_t bytes, size_t bitpos, SqttToken& token )
+{
+    if( arch == SqttArch::Gfx10 ) return ReadGfx10Token( data, bytes, bitpos, token );
+    if( !data || bytes > std::numeric_limits<size_t>::max() / 8 ) return false;
+    const size_t totalBits = bytes * 8;
+    if( bitpos > totalBits || totalBits - bitpos < 4 ) return false;
+
+    const uint64_t window = ReadTokenWindow( data, bytes, bitpos );
+    const auto encoding = GetTokenEncoding( arch, static_cast<uint8_t>( window ) );
+    if( encoding.token_len > totalBits - bitpos ) return false;
+
+    token = SqttToken { window, encoding };
+    return true;
+}
+
 uint16_t GetGfx10RegAddress( uint64_t window )
 {
     return static_cast<uint16_t>( ( window >> 16 ) & 0xFFF );
 }
 
+uint16_t GetRegAddress( SqttArch, uint64_t window )
+{
+    return GetGfx10RegAddress( window );
+}
+
+WaveTokenFields GetWaveStartFields( SqttArch arch, uint64_t window )
+{
+    const bool gfx12 = arch == SqttArch::Gfx12;
+    return WaveTokenFields {
+        static_cast<uint8_t>( ( window >> 7 ) & 0x1 ),
+        static_cast<uint8_t>( ( window >> 8 ) & 0x3 ),
+        static_cast<uint8_t>( ( window >> 10 ) & ( gfx12 ? 0xF : 0x7 ) ),
+        static_cast<uint8_t>( ( window >> ( gfx12 ? 15 : 13 ) ) & 0x1F ),
+    };
+}
+
+WaveTokenFields GetWaveEndFields( SqttArch arch, uint64_t window )
+{
+    const bool gfx12 = arch == SqttArch::Gfx12;
+    return WaveTokenFields {
+        static_cast<uint8_t>( ( window >> 8 ) & 0x1 ),
+        static_cast<uint8_t>( ( window >> 9 ) & 0x3 ),
+        static_cast<uint8_t>( ( window >> 11 ) & ( gfx12 ? 0xF : 0x7 ) ),
+        static_cast<uint8_t>( ( window >> 15 ) & 0x1F ),
+    };
+}
+
+uint8_t GetInstOpCode( SqttArch arch, uint64_t window )
+{
+    return static_cast<uint8_t>( ( window >> ( arch == SqttArch::Gfx12 ? 12 : 13 ) ) & ( arch == SqttArch::Gfx12 ? 0xFF : 0x7F ) );
+}
+
 MarkerDecodeResult DecodeMarkers( const std::vector<UserdataWord>& words )
 {
+    return DecodeMarkers( SqttArch::Gfx10, words );
+}
+
+MarkerDecodeResult DecodeMarkers( SqttArch arch, const std::vector<UserdataWord>& words )
+{
+    static constexpr std::array<std::array<uint16_t, 2>, 3> markerAddresses = {{
+        { SQ_THREAD_TRACE_USERDATA_2, SQ_THREAD_TRACE_USERDATA_3 },
+        { SQ_THREAD_TRACE_USERDATA_2, SQ_THREAD_TRACE_USERDATA_3 },
+        { SQ_THREAD_TRACE_USERDATA_2, SQ_THREAD_TRACE_USERDATA_3 },
+    }};
+    const size_t archIndex = static_cast<size_t>( arch );
+    const auto& addresses = markerAddresses[archIndex < markerAddresses.size() ? archIndex : 0];
     MarkerDecodeResult result;
     uint32_t currentCbId = 0;
     std::unordered_map<uint32_t, uint64_t> pipelineByCb;
     size_t wordIndex = 0;
     while( wordIndex < words.size() )
     {
-        if( words[wordIndex].address != SQ_THREAD_TRACE_USERDATA_2 )
+        if( words[wordIndex].address != addresses[0] )
         {
             wordIndex++;
             continue;
