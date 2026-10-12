@@ -191,6 +191,70 @@ static bool TestCommandBufferIdNormalization()
     return ok;
 }
 
+static bool TestTimeDeltaSemantics()
+{
+    bool ok = true;
+    const uint64_t gfx11Delta = 0x12345;
+    const SqttToken gfx11Timestamp {
+        0x01 | ( gfx11Delta << 12 ), GetTokenEncoding( SqttArch::Gfx11, 0x01 )
+    };
+    const SqttToken gfx11Marker {
+        0x01 | ( uint64_t( 1 ) << 9 ) | ( gfx11Delta << 12 ), GetTokenEncoding( SqttArch::Gfx11, 0x01 )
+    };
+    const SqttToken gfx11Realtime {
+        0x01 | ( uint64_t( 1 ) << 8 ) | ( uint64_t( 1 ) << 9 ) | ( gfx11Delta << 12 ),
+        GetTokenEncoding( SqttArch::Gfx11, 0x01 )
+    };
+    ok &= Check( GetTokenTimeDelta( SqttArch::Gfx11, gfx11Timestamp ) == gfx11Delta,
+        "decode GFX11 36-bit timestamp delta" );
+    ok &= Check( GetTokenTimeDelta( SqttArch::Gfx11, gfx11Marker ) == 0,
+        "zero GFX11 realtime marker delta" );
+    ok &= Check( GetTokenTimeDelta( SqttArch::Gfx11, gfx11Realtime ) == gfx11Delta,
+        "keep GFX11 realtime packet delta when PL is set" );
+    uint64_t realtimeTimestamp = 0;
+    ok &= Check( GetRealtimeTimestamp( SqttArch::Gfx11, gfx11Marker, realtimeTimestamp ) && realtimeTimestamp == gfx11Delta,
+        "extract GFX11 realtime correlation point" );
+
+    constexpr uint64_t gfx12Delta = ( uint64_t( 1 ) << 51 ) | 0xABCDE;
+    const SqttToken gfx12Timestamp {
+        0x01 | ( gfx12Delta << 12 ), GetTokenEncoding( SqttArch::Gfx12, 0x01 )
+    };
+    const SqttToken gfx12Marker {
+        0x01 | ( uint64_t( 1 ) << 7 ) | ( uint64_t( 0x123 ) << 12 ), GetTokenEncoding( SqttArch::Gfx12, 0x01 )
+    };
+    ok &= Check( GetTokenTimeDelta( SqttArch::Gfx12, gfx12Timestamp ) == gfx12Delta,
+        "decode GFX12 52-bit timestamp delta" );
+    ok &= Check( GetTokenTimeDelta( SqttArch::Gfx12, gfx12Marker ) == 0,
+        "zero GFX12 realtime marker delta" );
+    realtimeTimestamp = 0;
+    ok &= Check( GetRealtimeTimestamp( SqttArch::Gfx12, gfx12Marker, realtimeTimestamp ) && realtimeTimestamp == 0x123,
+        "extract GFX12 realtime correlation point" );
+
+    const SqttToken gfx10Delta {
+        0x01 | ( uint64_t( 1 ) << 14 ) | ( uint64_t( 0x2345 ) << 16 ), GetTokenEncoding( SqttArch::Gfx10, 0x01 )
+    };
+    const SqttToken gfx10Realtime {
+        0x01 | ( uint64_t( 2 ) << 14 ) | ( uint64_t( 0x6789 ) << 16 ), GetTokenEncoding( SqttArch::Gfx10, 0x01 )
+    };
+    realtimeTimestamp = 0;
+    ok &= Check( GetTokenTimeDelta( SqttArch::Gfx10, gfx10Delta ) == 0x2345,
+        "preserve GFX10 timestamp delta semantics" );
+    ok &= Check( GetTokenTimeDelta( SqttArch::Gfx10, gfx10Realtime ) == 0 &&
+        GetRealtimeTimestamp( SqttArch::Gfx10, gfx10Realtime, realtimeTimestamp ) && realtimeTimestamp == 0x6789,
+        "extract GFX10 realtime correlation point" );
+
+    const SqttToken gfx11ShortTime { 0x08 | ( 7u << 4 ), GetTokenEncoding( SqttArch::Gfx11, 0x08 ) };
+    ok &= Check( GetTokenTimeDelta( SqttArch::Gfx11, gfx11ShortTime ) == 11,
+        "add four cycles to GFX11 short timestamp delta" );
+    ok &= Check( GetInstWaveId( SqttArch::Gfx11, SqttTokenType::TOKEN_INST, uint64_t( 0x15 ) << 8 ) == 0x15,
+        "extract GFX11 INST wave slot" );
+    ok &= Check( GetInstWaveId( SqttArch::Gfx12, SqttTokenType::TOKEN_INST, uint64_t( 0x1A ) << 7 ) == 0x1A,
+        "extract GFX12 INST wave slot" );
+    ok &= Check( GetInstWaveId( SqttArch::Gfx12, SqttTokenType::TOKEN_VALU, uint64_t( 0x17 ) << 7 ) == 0x17,
+        "extract GFX12 VALU wave slot" );
+    return ok;
+}
+
 struct ExpectedTokenCount
 {
     SqttTokenType type;
@@ -342,7 +406,7 @@ static bool TestMalformedMarkers()
 
 int main()
 {
-    const bool ok = TestTokens() & TestArchTokens() & TestCommandBufferIdNormalization() & TestReferenceCaptures() &
-        TestMarkers() & TestMalformedMarkers();
+    const bool ok = TestTokens() & TestArchTokens() & TestCommandBufferIdNormalization() & TestTimeDeltaSemantics() &
+        TestReferenceCaptures() & TestMarkers() & TestMalformedMarkers();
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

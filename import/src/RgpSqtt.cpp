@@ -253,6 +253,49 @@ uint8_t GetInstOpCode( SqttArch arch, uint64_t window )
     return static_cast<uint8_t>( ( window >> ( arch == SqttArch::Gfx12 ? 12 : 13 ) ) & ( arch == SqttArch::Gfx12 ? 0xFF : 0x7F ) );
 }
 
+uint64_t GetTokenTimeDelta( SqttArch arch, const SqttToken& token )
+{
+    if( token.encoding.type == SqttTokenType::TOKEN_TIMESTAMP )
+    {
+        if( arch == SqttArch::Gfx10 )
+        {
+            return ( ( token.window >> 14 ) & 0x3 ) == 1 ? token.window >> 16 : 0;
+        }
+
+        const uint8_t realtimeBit = arch == SqttArch::Gfx12 ? 7 : 9;
+        if( ( ( token.window >> realtimeBit ) & 1 ) && !( ( token.window >> 8 ) & 1 ) ) return 0;
+    }
+
+    if( token.encoding.time_end <= token.encoding.time_begin ) return 0;
+    const uint8_t width = token.encoding.time_end - token.encoding.time_begin;
+    const uint64_t timeMask = ( uint64_t( 1 ) << width ) - 1;
+    const uint64_t delta = ( token.window >> token.encoding.time_begin ) & timeMask;
+    return delta + ( token.encoding.type == SqttTokenType::TOKEN_TIME ? 4 : 0 );
+}
+
+bool GetRealtimeTimestamp( SqttArch arch, const SqttToken& token, uint64_t& timestamp )
+{
+    if( token.encoding.type != SqttTokenType::TOKEN_TIMESTAMP ) return false;
+    if( arch == SqttArch::Gfx10 )
+    {
+        if( ( ( token.window >> 14 ) & 0x3 ) != 2 ) return false;
+        timestamp = token.window >> 16;
+        return true;
+    }
+
+    const uint8_t realtimeBit = arch == SqttArch::Gfx12 ? 7 : 9;
+    if( !( ( token.window >> realtimeBit ) & 1 ) || ( ( token.window >> 8 ) & 1 ) ) return false;
+    const uint8_t timestampWidth = arch == SqttArch::Gfx12 ? 52 : 36;
+    timestamp = ( token.window >> 12 ) & ( ( uint64_t( 1 ) << timestampWidth ) - 1 );
+    return true;
+}
+
+uint8_t GetInstWaveId( SqttArch arch, SqttTokenType type, uint64_t window )
+{
+    const uint8_t shift = type == SqttTokenType::TOKEN_INST && arch != SqttArch::Gfx12 ? 8 : 7;
+    return static_cast<uint8_t>( ( window >> shift ) & 0x1F );
+}
+
 uint32_t NormalizeCommandBufferId( uint32_t encodedId )
 {
     return ( encodedId & 1 ) ? ( encodedId >> 8 ) & 0xFFF : ( encodedId >> 1 ) & 0x7FFFF;

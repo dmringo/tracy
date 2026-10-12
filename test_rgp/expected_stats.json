@@ -11,10 +11,10 @@
     {
       "path": "samples/bioshock_infinite.rgp",
       "gfxLevel": "0xc",
-      "waves": 0,
-      "unknownTokens": 0,
-      "markers": 27200,
-      "decodeErrors": 15
+      "waves": 111065,
+      "unknownTokens": 844,
+      "markers": 27913,
+      "decodeErrors": 2
     },
     {
       "path": "samples/hl2_linux_2022.09.20_12.02.20.rgp",

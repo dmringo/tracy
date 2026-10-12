@@ -77,6 +77,9 @@ uint16_t GetGfx10RegAddress( uint64_t window );
 WaveTokenFields GetWaveStartFields( SqttArch arch, uint64_t window );
 WaveTokenFields GetWaveEndFields( SqttArch arch, uint64_t window );
 uint8_t GetInstOpCode( SqttArch arch, uint64_t window );
+uint64_t GetTokenTimeDelta( SqttArch arch, const SqttToken& token );
+bool GetRealtimeTimestamp( SqttArch arch, const SqttToken& token, uint64_t& timestamp );
+uint8_t GetInstWaveId( SqttArch arch, SqttTokenType type, uint64_t window );
 uint32_t NormalizeCommandBufferId( uint32_t encodedId );
 
 inline constexpr uint16_t SQ_THREAD_TRACE_USERDATA_2 = 0x342;

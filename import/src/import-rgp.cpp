@@ -8,8 +8,8 @@
 #include <cctype>
 #include <fstream>
 #include <functional>
-#include <memory>
 #include <map>
+#include <memory>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,10 +39,16 @@
 namespace rgp_sqtt = tracy::rgp_sqtt;
 using enum rgp_sqtt::SqttTokenType;
 using rgp_sqtt::DecodeMarkers;
-using rgp_sqtt::GetGfx10RegAddress;
-using rgp_sqtt::ReadGfx10Token;
+using rgp_sqtt::GetInstWaveId;
+using rgp_sqtt::GetRealtimeTimestamp;
+using rgp_sqtt::GetRegAddress;
+using rgp_sqtt::GetTokenTimeDelta;
+using rgp_sqtt::GetWaveEndFields;
+using rgp_sqtt::GetWaveStartFields;
+using rgp_sqtt::ReadToken;
 using rgp_sqtt::MarkerDecodeResult;
 using rgp_sqtt::SqttMarker;
+using rgp_sqtt::SqttArch;
 using rgp_sqtt::SqttToken;
 using rgp_sqtt::UserdataWord;
 using rgp_sqtt::MARKER_BARRIER_END;
@@ -61,6 +67,9 @@ using rgp_sqtt::SQ_THREAD_TRACE_USERDATA_3;
 static constexpr uint32_t SQTT_FILE_MAGIC_NUMBER  = 0x50303042; // 'B00P'
 static constexpr uint32_t SQTT_FILE_HEADER_SIZE   = 56;
 static constexpr uint32_t SQTT_GFXIP_LEVEL_GFXIP_10_3 = 0x9;
+static constexpr uint32_t SQTT_GFXIP_LEVEL_GFXIP_11_0 = 0xC;
+static constexpr uint32_t SQTT_GFXIP_LEVEL_GFXIP_11_5 = 0xD;
+static constexpr uint32_t SQTT_GFXIP_LEVEL_GFXIP_12 = 0x10;
 static constexpr int SQTT_SA_PER_SE = 2;
 
 // SQTT Chunk Types
@@ -249,12 +258,12 @@ struct sqtt_desc_record
 
 #pragma pack(pop)
 
-static bool Gfx10CuLocation( int se, int shaderEngines, int cuPerSe, int shaderArraysPerSe,
+static bool GfxCuLocation( int se, int shaderEngines, int cuPerSe, int shaderArraysPerSe, int simdsPerCu,
     uint32_t sa, uint32_t wgp, uint32_t simd, int& cuId, uint32_t& simdInCu )
 {
     constexpr int cusPerWgp = 2;
-    constexpr int simdsPerCu = 2;
-    if( se < 0 || se >= shaderEngines || shaderArraysPerSe <= 0 || cuPerSe % shaderArraysPerSe != 0 ) return false;
+    if( se < 0 || se >= shaderEngines || shaderArraysPerSe <= 0 || simdsPerCu <= 0 ||
+        cuPerSe % shaderArraysPerSe != 0 ) return false;
     if( sa >= static_cast<uint32_t>( shaderArraysPerSe ) || simd >= cusPerWgp * simdsPerCu ) return false;
 
     const int cusPerSa = cuPerSe / shaderArraysPerSe;
@@ -263,6 +272,25 @@ static bool Gfx10CuLocation( int se, int shaderEngines, int cuPerSe, int shaderA
     cuId = se * cuPerSe + sa * cusPerSa + wgp * cusPerWgp + simd / simdsPerCu;
     simdInCu = simd % simdsPerCu;
     return true;
+}
+
+static bool SqttArchFromGfxip( uint32_t gfxipLevel, SqttArch& arch )
+{
+    switch( gfxipLevel )
+    {
+    case SQTT_GFXIP_LEVEL_GFXIP_10_3:
+        arch = SqttArch::Gfx10;
+        return true;
+    case SQTT_GFXIP_LEVEL_GFXIP_11_0:
+    case SQTT_GFXIP_LEVEL_GFXIP_11_5:
+        arch = SqttArch::Gfx11;
+        return true;
+    case SQTT_GFXIP_LEVEL_GFXIP_12:
+        arch = SqttArch::Gfx12;
+        return true;
+    default:
+        return false;
+    }
 }
 
 struct MsgpackValue
@@ -642,6 +670,7 @@ struct SqttDecodeStats
     size_t invalidDurationWaves = 0;
     size_t unterminatedWaves = 0;
     size_t slicesOutsideWaves = 0;
+    std::map<uint8_t, size_t> unknownTokenPrefixes;
 };
 
 static void PrintSqttStats( const SqttDecodeStats& stats, size_t totalSlices )
@@ -675,6 +704,15 @@ static void PrintSqttStats( const SqttDecodeStats& stats, size_t totalSlices )
         stats.wavesAttributed, stats.wavesUnattributed );
     printf( "  unknown tokens: %zu; desyncs: %zu; truncated tokens: %zu; invalid-duration waves: %zu; unterminated waves: %zu\n",
         stats.unknownTokens, stats.desyncs, stats.truncatedTokens, stats.invalidDurationWaves, stats.unterminatedWaves );
+    if( !stats.unknownTokenPrefixes.empty() )
+    {
+        printf( "  unknown token prefixes:" );
+        for( const auto& prefix : stats.unknownTokenPrefixes )
+        {
+            printf( " 0x%02X(%zu)", prefix.first, prefix.second );
+        }
+        printf( "\n" );
+    }
 }
 
 static const char* GetQueueTypeName( uint8_t qtype )
@@ -703,7 +741,7 @@ int main( int argc, char** argv )
     bool printStats = false;
     const char* llvmObjdump = getenv( "TRACY_LLVM_OBJDUMP" );
     int arg = 1;
-    if( argc > arg && strcmp( argv[arg], "--stats" ) == 0 )
+    while( argc > arg )
     {
         if( strcmp( argv[arg], "--stats" ) == 0 )
         {
@@ -1118,10 +1156,15 @@ int main( int argc, char** argv )
 
     printf( "Processed %zu chunks (%zu SQTT streams, %zu shader ELFs).\n", chunkCount, sqttStreams.size(), elfObjects.size() );
 
-    const bool sqttArchSupported = sqttGfxipLevel == SQTT_GFXIP_LEVEL_GFXIP_10_3 && simdsPerCu == 2;
+    SqttArch sqttArch = SqttArch::Gfx10;
+    const bool sqttArchKnown = SqttArchFromGfxip( sqttGfxipLevel, sqttArch );
+    const bool sqttArchSupported = sqttArchKnown && simdsPerCu == 2;
     if( sqttArchSupported )
     {
-        printf( "  SQTT architecture: GFX10.3 (%s)\n", gpuName );
+        const char* archName = sqttArch == SqttArch::Gfx10 ? "GFX10.3" :
+            sqttArch == SqttArch::Gfx11 ? ( sqttGfxipLevel == SQTT_GFXIP_LEVEL_GFXIP_11_5 ? "GFX11.5" : "GFX11.0" ) :
+            "GFX12";
+        printf( "  SQTT architecture: %s (%s)\n", archName, gpuName );
     }
     else
     {
@@ -1204,12 +1247,15 @@ int main( int argc, char** argv )
         const size_t totalBits = streamBytes * 8;
         size_t bitpos = 0;
         uint64_t shaderTimestamp = 0;
+        uint64_t realtimeEpoch = 0;
+        uint64_t previousRealtimeRaw = 0;
+        bool hasRealtimeTimestamp = false;
         auto& points = streamRealtimePoints[streamIndex];
 
         while( bitpos + 4 <= totalBits )
         {
             SqttToken token {};
-            if( !ReadGfx10Token( streamData, streamBytes, bitpos, token ) ) break;
+            if( !ReadToken( sqttArch, streamData, streamBytes, bitpos, token ) ) break;
             const uint64_t window = token.window;
             const auto& info = token.encoding;
             if( info.type == TOKEN_UNKNOWN )
@@ -1218,24 +1264,37 @@ int main( int argc, char** argv )
                 continue;
             }
 
-            if( info.type == TOKEN_TIMESTAMP )
+            shaderTimestamp += GetTokenTimeDelta( sqttArch, token );
+            uint64_t realtimeTimestamp;
+            if( GetRealtimeTimestamp( sqttArch, token, realtimeTimestamp ) )
             {
-                const uint64_t timestampType = ( window >> 14 ) & 0x3;
-                const uint64_t timestamp = window >> 16;
-                if( timestampType == 1 )
+                if( sqttArch != SqttArch::Gfx10 )
                 {
-                    shaderTimestamp += timestamp;
+                    const uint8_t timestampWidth = sqttArch == SqttArch::Gfx12 ? 52 : 36;
+                    const uint64_t modulus = uint64_t( 1 ) << timestampWidth;
+                    const uint64_t timestampMask = modulus - 1;
+                    const uint64_t originRaw = sqttGpuOrigin & timestampMask;
+                    if( !hasRealtimeTimestamp )
+                    {
+                        realtimeEpoch = sqttGpuOrigin & ~timestampMask;
+                        if( realtimeTimestamp < originRaw && originRaw - realtimeTimestamp > modulus / 2 )
+                        {
+                            realtimeEpoch += modulus;
+                        }
+                        else if( realtimeTimestamp > originRaw && realtimeTimestamp - originRaw > modulus / 2 && realtimeEpoch >= modulus )
+                        {
+                            realtimeEpoch -= modulus;
+                        }
+                    }
+                    else if( realtimeTimestamp < previousRealtimeRaw && previousRealtimeRaw - realtimeTimestamp > modulus / 2 )
+                    {
+                        realtimeEpoch += modulus;
+                    }
+                    previousRealtimeRaw = realtimeTimestamp;
+                    hasRealtimeTimestamp = true;
+                    realtimeTimestamp += realtimeEpoch;
                 }
-                else if( timestampType == 2 )
-                {
-                    points.push_back( SqttRealtimePoint { shaderTimestamp, timestamp } );
-                }
-            }
-            else if( info.time_end > info.time_begin )
-            {
-                const uint64_t timeMask = ( uint64_t( 1 ) << ( info.time_end - info.time_begin ) ) - 1;
-                shaderTimestamp += ( window >> info.time_begin ) & timeMask;
-                if( info.type == TOKEN_TIME ) shaderTimestamp += 4;
+                points.push_back( SqttRealtimePoint { shaderTimestamp, realtimeTimestamp } );
             }
 
             bitpos += info.token_len;
@@ -1250,6 +1309,18 @@ int main( int argc, char** argv )
         totalRealtimePoints += points.size();
     }
     printf( "  SQTT shader/GPU clock correlation points: %zu across %zu streams\n", totalRealtimePoints, sqttStreams.size() );
+    for( size_t streamIndex = 0; streamIndex < streamRealtimePoints.size(); streamIndex++ )
+    {
+        const auto& points = streamRealtimePoints[streamIndex];
+        if( !points.empty() )
+        {
+            printf( "    Stream %zu correlation range: shader %llu..%llu, GPU %llu..%llu ticks\n", streamIndex,
+                static_cast<unsigned long long>( points.front().shaderTimestamp ),
+                static_cast<unsigned long long>( points.back().shaderTimestamp ),
+                static_cast<unsigned long long>( points.front().gpuTimestamp ),
+                static_cast<unsigned long long>( points.back().gpuTimestamp ) );
+        }
+    }
 
     auto ShaderTickToGpuTick = [&]( const std::vector<SqttRealtimePoint>& points, uint64_t shaderTick ) -> uint64_t {
         if( points.empty() ) return sqttGpuOrigin + shaderTick;
@@ -1384,7 +1455,7 @@ int main( int argc, char** argv )
         while( bitpos + 4 <= totalBits )
         {
             SqttToken token {};
-            if( !ReadGfx10Token( streamData, streamBytes, bitpos, token ) ) break;
+            if( !ReadToken( sqttArch, streamData, streamBytes, bitpos, token ) ) break;
             const uint64_t window = token.window;
             const auto& info = token.encoding;
             if( info.type == TOKEN_UNKNOWN )
@@ -1393,21 +1464,11 @@ int main( int argc, char** argv )
                 continue;
             }
 
-            if( info.type == TOKEN_TIMESTAMP )
-            {
-                const uint64_t timestampType = ( window >> 14 ) & 0x3;
-                if( timestampType == 1 ) shaderTimestamp += window >> 16;
-            }
-            else if( info.time_end > info.time_begin )
-            {
-                const uint64_t timeMask = ( uint64_t( 1 ) << ( info.time_end - info.time_begin ) ) - 1;
-                shaderTimestamp += ( window >> info.time_begin ) & timeMask;
-                if( info.type == TOKEN_TIME ) shaderTimestamp += 4;
-            }
+            shaderTimestamp += GetTokenTimeDelta( sqttArch, token );
 
             if( info.type == TOKEN_REG )
             {
-                const uint16_t address = GetGfx10RegAddress( window );
+                const uint16_t address = GetRegAddress( sqttArch, window );
                 if( address == SQ_THREAD_TRACE_USERDATA_2 || address == SQ_THREAD_TRACE_USERDATA_3 )
                 {
                     words.push_back( UserdataWord { address, static_cast<uint32_t>( window >> 32 ), shaderTimestamp } );
@@ -1415,7 +1476,7 @@ int main( int argc, char** argv )
             }
             bitpos += info.token_len;
         }
-        markerStreams[streamIndex] = DecodeMarkers( words );
+        markerStreams[streamIndex] = DecodeMarkers( sqttArch, words );
 
         if( selectedMarkerStream == SIZE_MAX ||
             markerStreams[streamIndex].markers.size() > markerStreams[selectedMarkerStream].markers.size() ||
@@ -1436,29 +1497,6 @@ int main( int argc, char** argv )
     int selectedMarkerSe = -1;
     if( printStats )
     {
-        for( size_t streamIndex = 0; streamIndex < markerStreams.size(); streamIndex++ )
-        {
-            size_t bindPipelineMarkers = 0;
-            size_t correlatedBindPipelineMarkers = 0;
-            for( const auto& marker : markerStreams[streamIndex].markers )
-            {
-                if( marker.identifier == MARKER_BIND_PIPELINE )
-                {
-                    bindPipelineMarkers++;
-                    if( psoPipelineHashes.count( marker.pipelineHash ) && !ambiguousPsoHashes.count( marker.pipelineHash ) )
-                        correlatedBindPipelineMarkers++;
-                }
-            }
-            printf( "  SE %d bind-pipeline markers: %zu (%zu correlated)\n",
-                sqttStreams[streamIndex].first.shader_engine_index, bindPipelineMarkers, correlatedBindPipelineMarkers );
-        }
-    }
-    if( selectedMarkerStream != SIZE_MAX )
-    {
-        const auto& decoded = markerStreams[selectedMarkerStream];
-        const auto& streamPoints = streamRealtimePoints[selectedMarkerStream];
-        selectedMarkerCount = decoded.markers.size();
-        markerDecodeErrors = decoded.errors;
         static constexpr std::array<const char*, 6> markerNames = {
             "CB_START", "CB_END", "BARRIER_START", "BARRIER_END", "EVENT", "BIND_PIPELINE"
         };
@@ -1500,6 +1538,29 @@ int main( int argc, char** argv )
         for( const auto& [cbId, count] : queueCbIds ) printf( " %u(%zu)", cbId, count );
         printf( "\n" );
 
+        for( size_t streamIndex = 0; streamIndex < markerStreams.size(); streamIndex++ )
+        {
+            size_t bindPipelineMarkers = 0;
+            size_t correlatedBindPipelineMarkers = 0;
+            for( const auto& marker : markerStreams[streamIndex].markers )
+            {
+                if( marker.identifier == MARKER_BIND_PIPELINE )
+                {
+                    bindPipelineMarkers++;
+                    if( psoPipelineHashes.count( marker.pipelineHash ) && !ambiguousPsoHashes.count( marker.pipelineHash ) )
+                        correlatedBindPipelineMarkers++;
+                }
+            }
+            printf( "  SE %d bind-pipeline markers: %zu (%zu correlated)\n",
+                sqttStreams[streamIndex].first.shader_engine_index, bindPipelineMarkers, correlatedBindPipelineMarkers );
+        }
+    }
+    if( selectedMarkerStream != SIZE_MAX )
+    {
+        const auto& decoded = markerStreams[selectedMarkerStream];
+        const auto& streamPoints = streamRealtimePoints[selectedMarkerStream];
+        selectedMarkerCount = decoded.markers.size();
+        markerDecodeErrors = decoded.errors;
         selectedMarkerSe = sqttStreams[selectedMarkerStream].first.shader_engine_index;
         auto FindSubmitSpan = [&]( uint32_t cbId, int64_t time ) -> const SubmitSpan* {
             const SubmitSpan* match = nullptr;
@@ -1901,7 +1962,7 @@ int main( int argc, char** argv )
         while( bitpos + 4 <= totalBits )
         {
             SqttToken token {};
-            if( !ReadGfx10Token( sData, sBytes, bitpos, token ) )
+            if( !ReadToken( sqttArch, sData, sBytes, bitpos, token ) )
             {
                 sqttStats.desyncs++;
                 sqttStats.truncatedTokens++;
@@ -1913,40 +1974,25 @@ int main( int argc, char** argv )
             if( info.type == TOKEN_UNKNOWN )
             {
                 sqttStats.unknownTokens++;
-                sqttStats.desyncs++;
+                sqttStats.unknownTokenPrefixes[static_cast<uint8_t>( window )]++;
                 bitpos += 4;
                 continue;
             }
             const uint64_t previousGpuTime = currentGpuTime;
-            uint32_t timeDelta = 0;
-            if( info.type == TOKEN_TIMESTAMP )
-            {
-                const uint64_t tsType = ( window >> 14 ) & 0x3;
-                const uint64_t tsTime = window >> 16;
-                if( tsType == 1 )
-                {
-                    currentGpuTime += tsTime;
-                }
-            }
-            else if( info.time_end > info.time_begin )
-            {
-                timeDelta = ( window >> info.time_begin ) & ( ( 1 << ( info.time_end - info.time_begin ) ) - 1 );
-                currentGpuTime += timeDelta + ( info.type == TOKEN_TIME ? 4 : 0 );
-            }
+            const uint64_t timeDelta = GetTokenTimeDelta( sqttArch, token );
+            currentGpuTime += timeDelta;
 
             if( info.type == TOKEN_WAVE_START || info.type == TOKEN_WAVE_START_EXT )
             {
-                const uint32_t simd = ( window >> 8 ) & 0x3;
-                const uint32_t wgp  = ( window >> 10 ) & 0x7;
-                const uint32_t sa   = ( window >> 7 ) & 0x1;
-                const uint32_t wid  = ( window >> 13 ) & 0x1F;
+                const auto fields = GetWaveStartFields( sqttArch, window );
 
                 int cuId;
                 uint32_t simdInCu;
-                if( Gfx10CuLocation( seIdx, shaderEngines, cuPerSe, SQTT_SA_PER_SE, sa, wgp, simd, cuId, simdInCu ) &&
-                    cuId < totalCUs && wid < static_cast<uint32_t>( maxSlots ) )
+                if( GfxCuLocation( seIdx, shaderEngines, cuPerSe, SQTT_SA_PER_SE, simdsPerCu,
+                    fields.sa, fields.wgp, fields.simd, cuId, simdInCu ) &&
+                    cuId < totalCUs && fields.wave < static_cast<uint32_t>( maxSlots ) )
                 {
-                    const uint64_t key = ( static_cast<uint64_t>( cuId ) << 16 ) | ( simdInCu << 8 ) | wid;
+                    const uint64_t key = ( static_cast<uint64_t>( cuId ) << 16 ) | ( simdInCu << 8 ) | fields.wave;
                     ActiveWave& aw = activeWaveMap[key];
                     if( aw.active ) sqttStats.unterminatedWaves++;
                     aw.startNs = StreamTickToNs( currentGpuTime );
@@ -1958,17 +2004,15 @@ int main( int argc, char** argv )
             }
             else if( info.type == TOKEN_WAVE_END )
             {
-                const uint32_t simd = ( window >> 9 ) & 0x3;
-                const uint32_t wgp  = ( window >> 11 ) & 0x7;
-                const uint32_t sa   = ( window >> 8 ) & 0x1;
-                const uint32_t wid  = ( window >> 15 ) & 0x1F;
+                const auto fields = GetWaveEndFields( sqttArch, window );
 
                 int cuId;
                 uint32_t simdInCu;
-                if( Gfx10CuLocation( seIdx, shaderEngines, cuPerSe, SQTT_SA_PER_SE, sa, wgp, simd, cuId, simdInCu ) &&
-                    cuId < totalCUs && wid < static_cast<uint32_t>( maxSlots ) )
+                if( GfxCuLocation( seIdx, shaderEngines, cuPerSe, SQTT_SA_PER_SE, simdsPerCu,
+                    fields.sa, fields.wgp, fields.simd, cuId, simdInCu ) &&
+                    cuId < totalCUs && fields.wave < static_cast<uint32_t>( maxSlots ) )
                 {
-                    const uint64_t key = ( static_cast<uint64_t>( cuId ) << 16 ) | ( simdInCu << 8 ) | wid;
+                    const uint64_t key = ( static_cast<uint64_t>( cuId ) << 16 ) | ( simdInCu << 8 ) | fields.wave;
                     auto it = activeWaveMap.find( key );
                     if( it != activeWaveMap.end() && it->second.active )
                     {
@@ -2020,7 +2064,7 @@ int main( int argc, char** argv )
                         wf.stateStartIndex = static_cast<uint32_t>( stateStart );
                         wf.stateCount = static_cast<uint32_t>( gpuWaveStates.size() - stateStart );
 
-                        gpuCUs[cuId].simds[simdInCu].slots[wid].waves.push_back( wf );
+                        gpuCUs[cuId].simds[simdInCu].slots[fields.wave].waves.push_back( wf );
                         if( seIdx >= 0 && static_cast<size_t>( seIdx ) < sqttStats.wavesPerSe.size() )
                         {
                             sqttStats.wavesPerSe[seIdx]++;
@@ -2035,7 +2079,7 @@ int main( int argc, char** argv )
             }
             else if( info.type == TOKEN_VALU || info.type == TOKEN_INST )
             {
-                const uint32_t wid = ( window >> ( info.type == TOKEN_INST ? 8 : 7 ) ) & 0x1F;
+                const uint32_t wid = GetInstWaveId( sqttArch, info.type, window );
 
                 if( targetLocationValid && wid < static_cast<uint32_t>( maxSlots ) )
                 {
@@ -2062,7 +2106,7 @@ int main( int argc, char** argv )
                 const uint32_t simd = ( window >> 13 ) & 0x3;
                 const uint32_t wgp = ( window >> 15 ) & 0x7;
                 const uint32_t sa = ( window >> 19 ) & 0x1;
-                targetLocationValid = Gfx10CuLocation( seIdx, shaderEngines, cuPerSe, SQTT_SA_PER_SE,
+                targetLocationValid = GfxCuLocation( seIdx, shaderEngines, cuPerSe, SQTT_SA_PER_SE, simdsPerCu,
                     sa, wgp, simd, targetCuId, targetSimdInCu ) && targetCuId < totalCUs;
             }
 
@@ -2159,26 +2203,60 @@ int main( int argc, char** argv )
         }
         if( !disasmError.empty() )
         {
-            const uint32_t dw0 = ReadElf32( object.textData + pc );
-            const uint32_t dw1 = ( pc + 8 <= object.textSize ) ? ReadElf32( object.textData + pc + 4 ) : 0;
-            DisasmResult dr = DisassembleAmdGpuInst( dw0, dw1 );
-            ts.lines.push_back( std::move( dr.text ) );
-            ts.pcs.push_back( pc );
+            fprintf( stderr, "Shader ELF %zu: %s\n", elfIdx, disasmError.c_str() );
+        }
+        for( const auto& instruction : instructions )
+        {
+            std::string line = instruction.mnemonic;
+            if( !instruction.operands.empty() ) line += " " + instruction.operands;
+            ts.lines.push_back( std::move( line ) );
+            ts.pcs.push_back( instruction.offset );
 
             tracy::GpuInstructionStats st {};
-            st.pc = pc;
+            st.pc = instruction.offset;
             st.issueCount = 1; // 1 issue in wave
             st.totalActiveLanes = 32; // 32 active SIMD lanes
-            st.category = dr.category;
-            if( dr.category == 6 ) st.aluStallCycles = dr.latencyCycles; // Wait
-            else if( dr.category == 5 ) st.ldsStallCycles = dr.latencyCycles; // Barrier
-            else if( dr.category == 2 ) st.vmemStallCycles = dr.latencyCycles; // VMEM
-            else if( dr.category == 3 ) st.smemStallCycles = dr.latencyCycles; // SMEM
-            else if( dr.category == 4 ) st.ldsStallCycles = dr.latencyCycles; // LDS
-            else st.aluStallCycles = dr.latencyCycles; // VALU / SALU
-            ts.stats.emplace( pc, st );
-
-            pc += ( dr.is64Bit ? 8 : 4 );
+            if( instruction.mnemonic == "s_waitcnt" || instruction.mnemonic.find( "s_waitcnt_" ) == 0 )
+            {
+                st.category = 6;
+                st.aluStallCycles = 32;
+            }
+            else if( instruction.mnemonic == "s_barrier" )
+            {
+                st.category = 5;
+                st.ldsStallCycles = 64;
+            }
+            else if( instruction.mnemonic.find( "s_branch" ) == 0 || instruction.mnemonic.find( "s_cbranch" ) == 0 )
+            {
+                st.category = 7;
+                st.aluStallCycles = 4;
+            }
+            else if( instruction.mnemonic.find( "s_load" ) == 0 || instruction.mnemonic.find( "s_buffer_load" ) == 0 )
+            {
+                st.category = 3;
+                st.smemStallCycles = 40;
+            }
+            else if( instruction.mnemonic.find( "buffer_" ) == 0 || instruction.mnemonic.find( "image_" ) == 0 || instruction.mnemonic.find( "flat_" ) == 0 )
+            {
+                st.category = 2;
+                st.vmemStallCycles = 220;
+            }
+            else if( instruction.mnemonic.find( "ds_" ) == 0 )
+            {
+                st.category = 4;
+                st.ldsStallCycles = 16;
+            }
+            else if( instruction.mnemonic.find( "s_" ) == 0 )
+            {
+                st.category = 1;
+                st.aluStallCycles = 1;
+            }
+            else
+            {
+                st.category = 0;
+                st.aluStallCycles = 4;
+            }
+            ts.stats.emplace( instruction.offset, st );
         }
         printf( "  Disassembled shader ELF %zu (pipeline 0x%016llx): %zu instructions\n",
             elfIdx, (unsigned long long)ts.pipelineHash, ts.lines.size() );
