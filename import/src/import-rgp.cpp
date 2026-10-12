@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,6 +14,7 @@
 #include <string.h>
 #include <string>
 #include <sys/stat.h>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 #include <zstd.h>
@@ -162,6 +164,60 @@ struct SqttRealtimePoint
     uint64_t gpuTimestamp;
 };
 
+struct RgpPipelineHash
+{
+    uint64_t low;
+    uint64_t high;
+
+    bool operator==( const RgpPipelineHash& other ) const
+    {
+        return low == other.low && high == other.high;
+    }
+};
+
+struct RgpPipelineHashHasher
+{
+    size_t operator()( const RgpPipelineHash& hash ) const
+    {
+        return std::hash<uint64_t> {}( hash.low ) ^ ( std::hash<uint64_t> {}( hash.high ) << 1 );
+    }
+};
+
+struct RgpLoaderEvent
+{
+    uint32_t type;
+    uint64_t baseAddress;
+    RgpPipelineHash codeObjectHash;
+    uint64_t timestamp;
+};
+
+struct RgpStageMetadata
+{
+    bool present = false;
+    uint16_t vgprCount = 0;
+    uint16_t sgprCount = 0;
+    uint32_t ldsSize = 0;
+};
+
+struct RgpElfMetadata
+{
+    bool hasPipelineHash = false;
+    RgpPipelineHash pipelineHash {};
+    uint8_t shaderStage = 0xFF;
+    uint16_t vgprCount = 0;
+    uint16_t sgprCount = 0;
+    uint32_t ldsSize = 0;
+    std::vector<RgpPipelineHash> apiShaderHashes;
+};
+
+struct RgpElfObject
+{
+    const uint8_t* textData = nullptr;
+    size_t textSize = 0;
+    RgpElfMetadata metadata;
+    std::vector<uint64_t> loadBaseAddresses;
+};
+
 struct PendingZone
 {
     uint64_t tid;
@@ -206,6 +262,364 @@ static bool Gfx10CuLocation( int se, int shaderEngines, int cuPerSe, int shaderA
     return true;
 }
 
+template<typename ActiveCommandBuffers>
+static bool ResolveBindCommandBufferId( uint32_t cbId, const ActiveCommandBuffers& activeCommandBuffers, uint32_t& resolvedId )
+{
+    const bool exactMatch = activeCommandBuffers.count( cbId ) != 0;
+    const uint32_t doubledId = cbId <= UINT32_MAX / 2 ? cbId * 2 : 0;
+    const bool doubledMatch = doubledId != 0 && activeCommandBuffers.count( doubledId ) != 0;
+    if( exactMatch == doubledMatch ) return false;
+    resolvedId = exactMatch ? cbId : doubledId;
+    return true;
+}
+
+struct MsgpackValue
+{
+    enum class Kind : uint8_t { Other, Number, String, Array, Map } kind = Kind::Other;
+    uint64_t number = 0;
+    std::string string;
+    std::vector<MsgpackValue> array;
+    std::vector<std::pair<std::string, MsgpackValue>> map;
+};
+
+class MsgpackReader
+{
+public:
+    MsgpackReader( const uint8_t* data, size_t size )
+        : m_data( data )
+        , m_size( size )
+    {
+    }
+
+    bool Read( MsgpackValue& value, unsigned depth = 0 )
+    {
+        if( depth > 16 || m_offset >= m_size ) return false;
+        const uint8_t tag = m_data[m_offset++];
+
+        if( tag <= 0x7F )
+        {
+            value.kind = MsgpackValue::Kind::Number;
+            value.number = tag;
+            return true;
+        }
+        if( tag >= 0xE0 )
+        {
+            value.kind = MsgpackValue::Kind::Number;
+            value.number = static_cast<uint64_t>( static_cast<int64_t>( static_cast<int8_t>( tag ) ) );
+            return true;
+        }
+        if( ( tag & 0xE0 ) == 0xA0 ) return ReadString( tag & 0x1F, value );
+        if( ( tag & 0xF0 ) == 0x90 ) return ReadArray( tag & 0x0F, value, depth );
+        if( ( tag & 0xF0 ) == 0x80 ) return ReadMap( tag & 0x0F, value, depth );
+
+        uint64_t length = 0;
+        switch( tag )
+        {
+        case 0xC0:
+        case 0xC2:
+        case 0xC3:
+            return true;
+        case 0xC4:
+            return ReadLength( 1, length ) && Skip( length );
+        case 0xC5:
+            return ReadLength( 2, length ) && Skip( length );
+        case 0xC6:
+            return ReadLength( 4, length ) && Skip( length );
+        case 0xCA:
+            return Skip( 4 );
+        case 0xCB:
+            return Skip( 8 );
+        case 0xCC:
+        case 0xD0:
+            if( !ReadLength( 1, value.number ) ) return false;
+            if( tag == 0xD0 ) value.number = static_cast<uint64_t>( static_cast<int64_t>( static_cast<int8_t>( value.number ) ) );
+            value.kind = MsgpackValue::Kind::Number;
+            return true;
+        case 0xCD:
+        case 0xD1:
+            if( !ReadLength( 2, value.number ) ) return false;
+            if( tag == 0xD1 ) value.number = static_cast<uint64_t>( static_cast<int64_t>( static_cast<int16_t>( value.number ) ) );
+            value.kind = MsgpackValue::Kind::Number;
+            return true;
+        case 0xCE:
+        case 0xD2:
+            if( !ReadLength( 4, value.number ) ) return false;
+            if( tag == 0xD2 ) value.number = static_cast<uint64_t>( static_cast<int64_t>( static_cast<int32_t>( value.number ) ) );
+            value.kind = MsgpackValue::Kind::Number;
+            return true;
+        case 0xCF:
+        case 0xD3:
+            if( !ReadLength( 8, value.number ) ) return false;
+            if( tag == 0xD3 ) value.number = static_cast<uint64_t>( static_cast<int64_t>( value.number ) );
+            value.kind = MsgpackValue::Kind::Number;
+            return true;
+        case 0xD9:
+            if( !ReadLength( 1, length ) ) return false;
+            return ReadString( length, value );
+        case 0xDA:
+            if( !ReadLength( 2, length ) ) return false;
+            return ReadString( length, value );
+        case 0xDB:
+            if( !ReadLength( 4, length ) ) return false;
+            return ReadString( length, value );
+        case 0xDC:
+            if( !ReadLength( 2, length ) ) return false;
+            return ReadArray( length, value, depth );
+        case 0xDD:
+            if( !ReadLength( 4, length ) ) return false;
+            return ReadArray( length, value, depth );
+        case 0xDE:
+            if( !ReadLength( 2, length ) ) return false;
+            return ReadMap( length, value, depth );
+        case 0xDF:
+            if( !ReadLength( 4, length ) ) return false;
+            return ReadMap( length, value, depth );
+        case 0xC7:
+            if( !ReadLength( 1, length ) ) return false;
+            return Skip( length + 1 );
+        case 0xC8:
+            if( !ReadLength( 2, length ) ) return false;
+            return Skip( length + 1 );
+        case 0xC9:
+            if( !ReadLength( 4, length ) ) return false;
+            return Skip( length + 1 );
+        case 0xD4: return Skip( 2 );
+        case 0xD5: return Skip( 3 );
+        case 0xD6: return Skip( 5 );
+        case 0xD7: return Skip( 9 );
+        case 0xD8: return Skip( 17 );
+        default:
+            return false;
+        }
+    }
+
+private:
+    bool ReadLength( size_t bytes, uint64_t& value )
+    {
+        if( bytes > m_size - m_offset ) return false;
+        value = 0;
+        for( size_t i = 0; i < bytes; i++ ) value = ( value << 8 ) | m_data[m_offset++];
+        return true;
+    }
+
+    bool Skip( uint64_t bytes )
+    {
+        if( bytes > m_size - m_offset ) return false;
+        m_offset += static_cast<size_t>( bytes );
+        return true;
+    }
+
+    bool ReadString( uint64_t length, MsgpackValue& value )
+    {
+        if( length > m_size - m_offset || length > 1024 * 1024 ) return false;
+        value.kind = MsgpackValue::Kind::String;
+        value.string.assign( reinterpret_cast<const char*>( m_data + m_offset ), static_cast<size_t>( length ) );
+        m_offset += static_cast<size_t>( length );
+        return true;
+    }
+
+    bool ReadArray( uint64_t count, MsgpackValue& value, unsigned depth )
+    {
+        if( count > 4096 ) return false;
+        value.kind = MsgpackValue::Kind::Array;
+        value.array.resize( static_cast<size_t>( count ) );
+        for( auto& item : value.array ) if( !Read( item, depth + 1 ) ) return false;
+        return true;
+    }
+
+    bool ReadMap( uint64_t count, MsgpackValue& value, unsigned depth )
+    {
+        if( count > 4096 ) return false;
+        value.kind = MsgpackValue::Kind::Map;
+        value.map.reserve( static_cast<size_t>( count ) );
+        for( uint64_t i = 0; i < count; i++ )
+        {
+            MsgpackValue key;
+            MsgpackValue item;
+            if( !Read( key, depth + 1 ) || !Read( item, depth + 1 ) ) return false;
+            if( key.kind == MsgpackValue::Kind::String ) value.map.emplace_back( std::move( key.string ), std::move( item ) );
+        }
+        return true;
+    }
+
+    const uint8_t* m_data;
+    size_t m_size;
+    size_t m_offset = 0;
+};
+
+static const MsgpackValue* GetMsgpackField( const MsgpackValue& value, const char* name )
+{
+    if( value.kind != MsgpackValue::Kind::Map ) return nullptr;
+    for( const auto& field : value.map ) if( field.first == name ) return &field.second;
+    return nullptr;
+}
+
+static bool GetMsgpackNumber( const MsgpackValue* value, uint64_t& number )
+{
+    if( !value || value->kind != MsgpackValue::Kind::Number ) return false;
+    number = value->number;
+    return true;
+}
+
+static int RgpHardwareStage( const std::string& name )
+{
+    static const char* stages[] = { ".vs", ".ls", ".hs", ".es", ".gs", ".ps", ".cs" };
+    for( int i = 0; i < 7; i++ ) if( name == stages[i] ) return i;
+    return -1;
+}
+
+static bool ParseRgpPipelineMetadata( const MsgpackValue& pipeline, RgpElfMetadata& metadata )
+{
+    const auto* hash = GetMsgpackField( pipeline, ".internal_pipeline_hash" );
+    if( !hash || hash->kind != MsgpackValue::Kind::Array || hash->array.size() < 2 ||
+        !GetMsgpackNumber( &hash->array[0], metadata.pipelineHash.low ) ||
+        !GetMsgpackNumber( &hash->array[1], metadata.pipelineHash.high ) ) return false;
+    metadata.hasPipelineHash = true;
+
+    std::array<RgpStageMetadata, 7> stages {};
+    const auto* hardwareStages = GetMsgpackField( pipeline, ".hardware_stages" );
+    if( hardwareStages && hardwareStages->kind == MsgpackValue::Kind::Map )
+    {
+        for( const auto& item : hardwareStages->map )
+        {
+            const int stage = RgpHardwareStage( item.first );
+            if( stage < 0 ) continue;
+            auto& data = stages[stage];
+            data.present = true;
+            uint64_t value = 0;
+            if( GetMsgpackNumber( GetMsgpackField( item.second, ".vgpr_count" ), value ) && value <= UINT16_MAX ) data.vgprCount = static_cast<uint16_t>( value );
+            if( GetMsgpackNumber( GetMsgpackField( item.second, ".sgpr_count" ), value ) && value <= UINT16_MAX ) data.sgprCount = static_cast<uint16_t>( value );
+            if( GetMsgpackNumber( GetMsgpackField( item.second, ".lds_size" ), value ) && value <= UINT32_MAX ) data.ldsSize = static_cast<uint32_t>( value );
+        }
+    }
+
+    const auto* shaders = GetMsgpackField( pipeline, ".shaders" );
+    if( shaders && shaders->kind == MsgpackValue::Kind::Map )
+    {
+        for( const auto& item : shaders->map )
+        {
+            const auto* apiHash = GetMsgpackField( item.second, ".api_shader_hash" );
+            if( apiHash && apiHash->kind == MsgpackValue::Kind::Array && apiHash->array.size() >= 2 )
+            {
+                RgpPipelineHash shaderHash {};
+                if( GetMsgpackNumber( &apiHash->array[0], shaderHash.low ) &&
+                    GetMsgpackNumber( &apiHash->array[1], shaderHash.high ) ) metadata.apiShaderHashes.push_back( shaderHash );
+            }
+
+            const auto* mapping = GetMsgpackField( item.second, ".hardware_mapping" );
+            if( mapping && mapping->kind == MsgpackValue::Kind::Array && !mapping->array.empty() &&
+                mapping->array[0].kind == MsgpackValue::Kind::String )
+            {
+                const int stage = RgpHardwareStage( mapping->array[0].string );
+                if( stage >= 0 ) stages[stage].present = true;
+            }
+        }
+    }
+
+    int stageCount = 0;
+    int onlyStage = -1;
+    for( int stage = 0; stage < static_cast<int>( stages.size() ); stage++ )
+    {
+        if( stages[stage].present )
+        {
+            stageCount++;
+            onlyStage = stage;
+        }
+    }
+    if( stageCount == 1 )
+    {
+        metadata.shaderStage = static_cast<uint8_t>( onlyStage );
+        metadata.vgprCount = stages[onlyStage].vgprCount;
+        metadata.sgprCount = stages[onlyStage].sgprCount;
+        metadata.ldsSize = stages[onlyStage].ldsSize;
+    }
+    return true;
+}
+
+static uint16_t ReadElf16( const uint8_t* data )
+{
+    uint16_t value;
+    memcpy( &value, data, sizeof( value ) );
+    return value;
+}
+
+static uint32_t ReadElf32( const uint8_t* data )
+{
+    uint32_t value;
+    memcpy( &value, data, sizeof( value ) );
+    return value;
+}
+
+static uint64_t ReadElf64( const uint8_t* data )
+{
+    uint64_t value;
+    memcpy( &value, data, sizeof( value ) );
+    return value;
+}
+
+static bool ParseRgpElfObject( const uint8_t* elfData, size_t elfSize, RgpElfObject& object )
+{
+    if( elfSize < 64 || elfData[4] != 2 || elfData[5] != 1 ) return false;
+    const uint64_t sectionOffset = ReadElf64( elfData + 40 );
+    const uint16_t sectionEntrySize = ReadElf16( elfData + 58 );
+    const uint16_t sectionCount = ReadElf16( elfData + 60 );
+    const uint16_t sectionNameIndex = ReadElf16( elfData + 62 );
+    if( sectionEntrySize < 64 || sectionCount == 0 || sectionNameIndex >= sectionCount ||
+        sectionOffset > elfSize || sectionCount > ( elfSize - sectionOffset ) / sectionEntrySize ) return false;
+
+    const uint8_t* namesHeader = elfData + sectionOffset + sectionNameIndex * sectionEntrySize;
+    const uint64_t namesOffset = ReadElf64( namesHeader + 24 );
+    const uint64_t namesSize = ReadElf64( namesHeader + 32 );
+    if( namesOffset > elfSize || namesSize > elfSize - namesOffset ) return false;
+
+    const uint8_t* noteData = nullptr;
+    size_t noteSize = 0;
+    for( uint16_t i = 0; i < sectionCount; i++ )
+    {
+        const uint8_t* section = elfData + sectionOffset + static_cast<size_t>( i ) * sectionEntrySize;
+        const uint32_t nameOffset = ReadElf32( section );
+        if( nameOffset >= namesSize ) continue;
+        const char* name = reinterpret_cast<const char*>( elfData + namesOffset + nameOffset );
+        const size_t remaining = static_cast<size_t>( namesSize - nameOffset );
+        const void* terminator = memchr( name, '\0', remaining );
+        if( !terminator ) continue;
+        const uint64_t dataOffset = ReadElf64( section + 24 );
+        const uint64_t dataSize = ReadElf64( section + 32 );
+        if( dataOffset > elfSize || dataSize > elfSize - dataOffset ) continue;
+        if( strcmp( name, ".text" ) == 0 )
+        {
+            object.textData = elfData + dataOffset;
+            object.textSize = static_cast<size_t>( dataSize );
+        }
+        else if( strcmp( name, ".note" ) == 0 )
+        {
+            noteData = elfData + dataOffset;
+            noteSize = static_cast<size_t>( dataSize );
+        }
+    }
+    if( !noteData || noteSize < 12 ) return false;
+
+    const uint32_t nameSize = ReadElf32( noteData );
+    const uint32_t descriptionSize = ReadElf32( noteData + 4 );
+    const uint32_t noteType = ReadElf32( noteData + 8 );
+    const size_t nameOffset = 12;
+    const size_t descriptionOffset = nameOffset + ( ( static_cast<size_t>( nameSize ) + 3 ) & ~size_t( 3 ) );
+    if( nameSize == 0 || nameSize > noteSize - nameOffset || descriptionOffset > noteSize ||
+        descriptionSize > noteSize - descriptionOffset || noteType != 32 ||
+        memcmp( noteData + nameOffset, "AMDGPU", 6 ) != 0 ) return false;
+
+    MsgpackValue root;
+    MsgpackReader reader( noteData + descriptionOffset, descriptionSize );
+    if( !reader.Read( root ) ) return false;
+    const auto* pipelines = GetMsgpackField( root, "amdpal.pipelines" );
+    if( !pipelines || pipelines->kind != MsgpackValue::Kind::Array ) return false;
+    for( const auto& pipeline : pipelines->array )
+    {
+        if( ParseRgpPipelineMetadata( pipeline, object.metadata ) ) return object.textData && object.textSize > 0;
+    }
+    return false;
+}
+
 void Usage()
 {
     printf( "tracy-import-rgp %i.%i.%i / %s\n\n", tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch, tracy::GitRef );
@@ -226,6 +640,8 @@ struct SqttDecodeStats
     std::vector<uint64_t> wavesPerSe;
     std::vector<int64_t> waveDurations;
     size_t wavesWithStates = 0;
+    size_t wavesAttributed = 0;
+    size_t wavesUnattributed = 0;
     size_t wavesOutsideSubmitSpans = 0;
     size_t unknownTokens = 0;
     size_t desyncs = 0;
@@ -262,6 +678,8 @@ static void PrintSqttStats( const SqttDecodeStats& stats, size_t totalSlices )
         stats.wavesWithStates, stats.waveDurations.size(), totalSlices, stats.slicesOutsideWaves );
     printf( "  waves outside any submit span (+/-10 us): %zu/%zu\n",
         stats.wavesOutsideSubmitSpans, stats.waveDurations.size() );
+    printf( "  waves attributed to a shader pipeline: %zu; unattributed: %zu\n",
+        stats.wavesAttributed, stats.wavesUnattributed );
     printf( "  unknown tokens: %zu; desyncs: %zu; truncated tokens: %zu; invalid-duration waves: %zu; unterminated waves: %zu\n",
         stats.unknownTokens, stats.desyncs, stats.truncatedTokens, stats.invalidDurationWaves, stats.unterminatedWaves );
 }
@@ -677,6 +1095,9 @@ int main( int argc, char** argv )
     std::vector<sqtt_queue_info_record> queueInfos;
     std::vector<sqtt_queue_event_record> queueEvents;
     std::unordered_map<uint64_t, std::string> psoNames;
+    std::unordered_map<uint64_t, RgpPipelineHash> psoPipelineHashes;
+    std::unordered_set<uint64_t> ambiguousPsoHashes;
+    std::vector<RgpLoaderEvent> loaderEvents;
 
     uint32_t spmNumTimestamps = 0;
     uint32_t spmNumCounters = 0;
@@ -781,11 +1202,44 @@ int main( int argc, char** argv )
                 for( uint32_t i = 0; i < rcount && ptr + sizeof( sqtt_pso_correlation_record ) <= chunkPayload + payloadSize; i++ )
                 {
                     const auto* rec = reinterpret_cast<const sqtt_pso_correlation_record*>( ptr );
+                    const RgpPipelineHash pipelineHash { rec->pipeline_hash[0], rec->pipeline_hash[1] };
+                    const auto existingHash = psoPipelineHashes.find( rec->api_pso_hash );
+                    if( existingHash != psoPipelineHashes.end() && !( existingHash->second == pipelineHash ) )
+                    {
+                        psoPipelineHashes.erase( existingHash );
+                        ambiguousPsoHashes.insert( rec->api_pso_hash );
+                    }
+                    else if( !ambiguousPsoHashes.count( rec->api_pso_hash ) )
+                    {
+                        psoPipelineHashes.emplace( rec->api_pso_hash, pipelineHash );
+                    }
                     if( rec->api_level_obj_name[0] != '\0' )
                     {
                         psoNames[rec->api_pso_hash] = rec->api_level_obj_name;
                     }
                     ptr += ( rsize > 0 ) ? rsize : sizeof( sqtt_pso_correlation_record );
+                }
+            }
+            break;
+        }
+        case SQTT_FILE_CHUNK_TYPE_CODE_OBJECT_LOADER_EVENTS:
+        {
+            if( payloadSize >= 16 )
+            {
+                const uint32_t recordSize = ReadElf32( chunkPayload + 8 );
+                const uint32_t recordCount = ReadElf32( chunkPayload + 12 );
+                if( recordSize >= 40 && recordCount <= ( payloadSize - 16 ) / recordSize )
+                {
+                    const uint8_t* ptr = chunkPayload + 16;
+                    for( uint32_t i = 0; i < recordCount; i++, ptr += recordSize )
+                    {
+                        loaderEvents.push_back( RgpLoaderEvent {
+                            ReadElf32( ptr ),
+                            ReadElf64( ptr + 8 ),
+                            RgpPipelineHash { ReadElf64( ptr + 16 ), ReadElf64( ptr + 24 ) },
+                            ReadElf64( ptr + 32 )
+                        } );
+                    }
                 }
             }
             break;
@@ -852,6 +1306,71 @@ int main( int argc, char** argv )
 
         offset += static_cast<size_t>( chunkSize );
         chunkCount++;
+    }
+
+    std::vector<RgpElfObject> shaderObjects;
+    shaderObjects.reserve( elfObjects.size() );
+    for( const auto& elf : elfObjects )
+    {
+        RgpElfObject object;
+        if( ParseRgpElfObject( elf.first, elf.second, object ) ) shaderObjects.push_back( std::move( object ) );
+    }
+
+    std::unordered_map<uint64_t, RgpPipelineHash> pipelineHashOwners;
+    std::unordered_set<uint64_t> ambiguousPipelineHashes;
+    for( const auto& object : shaderObjects )
+    {
+        const auto& hash = object.metadata.pipelineHash;
+        const auto existingHash = pipelineHashOwners.find( hash.low );
+        if( existingHash != pipelineHashOwners.end() && !( existingHash->second == hash ) )
+        {
+            pipelineHashOwners.erase( existingHash );
+            ambiguousPipelineHashes.insert( hash.low );
+        }
+        else if( !ambiguousPipelineHashes.count( hash.low ) )
+        {
+            pipelineHashOwners.emplace( hash.low, hash );
+        }
+    }
+
+    std::unordered_map<RgpPipelineHash, uint64_t, RgpPipelineHashHasher> shaderHashByPipeline;
+    for( const auto& owner : pipelineHashOwners )
+    {
+        if( !ambiguousPipelineHashes.count( owner.first ) ) shaderHashByPipeline.emplace( owner.second, owner.first );
+    }
+
+    std::unordered_map<RgpPipelineHash, std::vector<const RgpLoaderEvent*>, RgpPipelineHashHasher> loaderEventsByHash;
+    for( const auto& event : loaderEvents )
+    {
+        if( event.type == 0 && event.baseAddress != 0 ) loaderEventsByHash[event.codeObjectHash].push_back( &event );
+    }
+    size_t matchedLoaderObjects = 0;
+    for( auto& object : shaderObjects )
+    {
+        const auto pipelineEvents = loaderEventsByHash.find( object.metadata.pipelineHash );
+        if( pipelineEvents != loaderEventsByHash.end() )
+        {
+            for( const auto* event : pipelineEvents->second )
+            {
+                if( std::find( object.loadBaseAddresses.begin(), object.loadBaseAddresses.end(), event->baseAddress ) == object.loadBaseAddresses.end() )
+                {
+                    object.loadBaseAddresses.push_back( event->baseAddress );
+                }
+            }
+        }
+        for( const RgpPipelineHash apiShaderHash : object.metadata.apiShaderHashes )
+        {
+            const auto events = loaderEventsByHash.find( apiShaderHash );
+            if( events == loaderEventsByHash.end() ) continue;
+            for( const auto* event : events->second )
+            {
+                if( std::find( object.loadBaseAddresses.begin(), object.loadBaseAddresses.end(), event->baseAddress ) == object.loadBaseAddresses.end() )
+                {
+                    object.loadBaseAddresses.push_back( event->baseAddress );
+                }
+            }
+        }
+        if( !object.loadBaseAddresses.empty() ) matchedLoaderObjects++;
     }
 
     printf( "Processed %zu chunks (%zu SQTT streams, %zu shader ELFs).\n", chunkCount, sqttStreams.size(), elfObjects.size() );
@@ -1165,10 +1684,32 @@ int main( int argc, char** argv )
     }
 
     std::array<size_t, 5> markerZoneCounts {};
+    size_t dispatchZonesWithPipeline = 0;
+    size_t dispatchZonesWithShader = 0;
+    size_t dispatchZonesTotal = 0;
     size_t markerDecodeErrors = 0;
     size_t unmatchedMarkers = 0;
     size_t selectedMarkerCount = 0;
     int selectedMarkerSe = -1;
+    if( printStats )
+    {
+        for( size_t streamIndex = 0; streamIndex < markerStreams.size(); streamIndex++ )
+        {
+            size_t bindPipelineMarkers = 0;
+            size_t correlatedBindPipelineMarkers = 0;
+            for( const auto& marker : markerStreams[streamIndex].markers )
+            {
+                if( marker.identifier == MARKER_BIND_PIPELINE )
+                {
+                    bindPipelineMarkers++;
+                    if( psoPipelineHashes.count( marker.pipelineHash ) && !ambiguousPsoHashes.count( marker.pipelineHash ) )
+                        correlatedBindPipelineMarkers++;
+                }
+            }
+            printf( "  SE %d bind-pipeline markers: %zu (%zu correlated)\n",
+                sqttStreams[streamIndex].first.shader_engine_index, bindPipelineMarkers, correlatedBindPipelineMarkers );
+        }
+    }
     if( selectedMarkerStream != SIZE_MAX )
     {
         const auto& decoded = markerStreams[selectedMarkerStream];
@@ -1212,6 +1753,7 @@ int main( int argc, char** argv )
         std::unordered_map<uint32_t, OpenMarkerZone> openEvents;
         std::unordered_map<uint32_t, OpenMarkerZone> openBarriers;
         std::unordered_map<uint32_t, std::vector<OpenMarkerZone>> openUserEvents;
+        std::unordered_map<uint32_t, uint64_t> boundPipelinesByCb;
 
         auto AddMarkerZone = [&]( const SubmitSpan& span, int64_t start, int64_t end,
             const std::string& name, const std::string& text, uint32_t depth, size_t kind ) -> size_t {
@@ -1256,6 +1798,15 @@ int main( int argc, char** argv )
         {
             const int64_t time = MarkerTimeNs( marker );
             const SubmitSpan* span = FindSubmitSpan( marker.cbId, time );
+            if( marker.identifier == MARKER_CB_START ) boundPipelinesByCb.erase( marker.cbId );
+            else if( marker.identifier == MARKER_CB_END ) boundPipelinesByCb.erase( marker.cbId );
+            else if( marker.identifier == MARKER_BIND_PIPELINE )
+            {
+                uint32_t bindCbId;
+                if( ResolveBindCommandBufferId( marker.cbId, commandBufferSpans, bindCbId ) )
+                    boundPipelinesByCb[bindCbId] = marker.pipelineHash;
+                continue;
+            }
             if( marker.identifier == MARKER_CB_START )
             {
                 span = FindSubmitSpan( marker.cbId, time );
@@ -1309,10 +1860,37 @@ int main( int argc, char** argv )
             {
                 CloseEvent( marker.cbId, time );
                 std::string name = EventName( marker.apiType );
-                const auto psoName = psoNames.find( marker.pipelineHash );
+                std::string text = "Command " + std::to_string( marker.apiType );
+                const auto boundPipeline = boundPipelinesByCb.find( marker.cbId );
+                const uint64_t apiPsoHash = boundPipeline == boundPipelinesByCb.end() ? 0 : boundPipeline->second;
+                const auto psoName = psoNames.find( apiPsoHash );
                 if( psoName != psoNames.end() && !psoName->second.empty() ) name += " - " + psoName->second;
+                const bool isDrawOrDispatch = marker.apiType <= 7 || ( marker.apiType >= 41 && marker.apiType <= 43 );
+                if( isDrawOrDispatch )
+                {
+                    dispatchZonesTotal++;
+                    if( apiPsoHash != 0 )
+                    {
+                        dispatchZonesWithPipeline++;
+                        char psoText[40];
+                        snprintf( psoText, sizeof( psoText ), ", PSO 0x%016llx", (unsigned long long)apiPsoHash );
+                        text += psoText;
+                        const auto psoPipeline = psoPipelineHashes.find( apiPsoHash );
+                        if( psoPipeline != psoPipelineHashes.end() && !ambiguousPsoHashes.count( apiPsoHash ) )
+                        {
+                            const auto shaderHash = shaderHashByPipeline.find( psoPipeline->second );
+                            if( shaderHash != shaderHashByPipeline.end() && shaderHash->second != 0 )
+                            {
+                                char pipelineText[48];
+                                snprintf( pipelineText, sizeof( pipelineText ), " -> Pipeline 0x%016llx", (unsigned long long)shaderHash->second );
+                                text += pipelineText;
+                                dispatchZonesWithShader++;
+                            }
+                        }
+                    }
+                }
                 const size_t zoneIndex = AddMarkerZone( *span, time, span->end, name,
-                    "Command " + std::to_string( marker.apiType ), 2, 1 );
+                    text, 2, 1 );
                 openEvents[marker.cbId] = OpenMarkerZone { zoneIndex, span };
             }
             else if( marker.identifier == MARKER_BARRIER_START )
@@ -1411,6 +1989,8 @@ int main( int argc, char** argv )
         }
         printf( "  Marker zones: command buffers %zu, events %zu, barriers %zu, user events %zu, layout transitions %zu\n",
             markerZoneCounts[0], markerZoneCounts[1], markerZoneCounts[2], markerZoneCounts[3], markerZoneCounts[4] );
+        printf( "  Draw/dispatch zones with bound pipeline: %zu/%zu; resolved shader: %zu/%zu\n",
+            dispatchZonesWithPipeline, dispatchZonesTotal, dispatchZonesWithShader, dispatchZonesTotal );
     }
 
     // Decode SQTT Wavefront and Wave Slot Concurrency
@@ -1442,6 +2022,7 @@ int main( int argc, char** argv )
     {
         int64_t startNs = 0;
         uint32_t wgid = 0;
+        uint64_t pipelineHash = 0;
         std::vector<tracy::GpuWaveStateSlice> states;
         bool active = false;
     };
@@ -1475,6 +2056,67 @@ int main( int argc, char** argv )
         int targetCuId = -1;
         uint32_t targetSimdInCu = 0;
         bool targetLocationValid = false;
+
+        std::vector<const SqttMarker*> timedMarkers;
+        timedMarkers.reserve( markerStreams[streamIndex].markers.size() );
+        for( const auto& marker : markerStreams[streamIndex].markers ) timedMarkers.push_back( &marker );
+        std::stable_sort( timedMarkers.begin(), timedMarkers.end(), []( const auto* lhs, const auto* rhs ) {
+            return lhs->shaderTimestamp < rhs->shaderTimestamp;
+        } );
+        size_t nextMarker = 0;
+        std::unordered_map<uint32_t, uint64_t> commandBufferPipelines;
+        std::unordered_set<uint32_t> activeCommandBuffers;
+        auto PipelineAtTime = [&]( uint64_t shaderTimestamp ) -> uint64_t {
+            while( nextMarker < timedMarkers.size() && timedMarkers[nextMarker]->shaderTimestamp <= shaderTimestamp )
+            {
+                const auto& marker = *timedMarkers[nextMarker++];
+                if( marker.identifier == MARKER_CB_START )
+                {
+                    activeCommandBuffers.insert( marker.cbId );
+                    commandBufferPipelines.erase( marker.cbId );
+                }
+                else if( marker.identifier == MARKER_CB_END )
+                {
+                    activeCommandBuffers.erase( marker.cbId );
+                    commandBufferPipelines.erase( marker.cbId );
+                }
+                else if( marker.identifier == MARKER_BIND_PIPELINE )
+                {
+                    uint32_t bindCbId;
+                    if( ResolveBindCommandBufferId( marker.cbId, activeCommandBuffers, bindCbId ) )
+                        commandBufferPipelines[bindCbId] = marker.pipelineHash;
+                }
+            }
+
+            uint64_t pipelineHash = 0;
+            bool hasPipeline = false;
+            bool ambiguous = false;
+            for( const uint32_t cbId : activeCommandBuffers )
+            {
+                const auto commandBufferPipeline = commandBufferPipelines.find( cbId );
+                if( commandBufferPipeline == commandBufferPipelines.end() || commandBufferPipeline->second == 0 )
+                {
+                    ambiguous = true;
+                    continue;
+                }
+                const auto psoPipeline = psoPipelineHashes.find( commandBufferPipeline->second );
+                if( psoPipeline == psoPipelineHashes.end() || ambiguousPsoHashes.count( commandBufferPipeline->second ) )
+                {
+                    ambiguous = true;
+                    continue;
+                }
+                const auto shaderHash = shaderHashByPipeline.find( psoPipeline->second );
+                if( shaderHash == shaderHashByPipeline.end() || shaderHash->second == 0 )
+                {
+                    ambiguous = true;
+                    continue;
+                }
+                if( hasPipeline && pipelineHash != shaderHash->second ) ambiguous = true;
+                pipelineHash = shaderHash->second;
+                hasPipeline = true;
+            }
+            return hasPipeline && !ambiguous ? pipelineHash : 0;
+        };
 
         while( bitpos + 4 <= totalBits )
         {
@@ -1529,6 +2171,7 @@ int main( int argc, char** argv )
                     if( aw.active ) sqttStats.unterminatedWaves++;
                     aw.startNs = StreamTickToNs( currentGpuTime );
                     aw.wgid = 0;
+                    aw.pipelineHash = PipelineAtTime( currentGpuTime );
                     aw.states.clear();
                     aw.active = true;
                 }
@@ -1567,7 +2210,9 @@ int main( int argc, char** argv )
                         wf.workgroupX = it->second.wgid;
                         wf.workgroupY = 0;
                         wf.workgroupZ = 0;
-                        wf.pipelineHash = !elfObjects.empty() ? ( 0x1000 + ( cuId % elfObjects.size() ) ) : 0;
+                        wf.pipelineHash = it->second.pipelineHash;
+                        if( wf.pipelineHash != 0 ) sqttStats.wavesAttributed++;
+                        else sqttStats.wavesUnattributed++;
                         wf.waveId = uint32_t( totalDecodedWaves + 1 );
 
                         constexpr int64_t submitToleranceNs = 10000;
@@ -1679,90 +2324,72 @@ int main( int argc, char** argv )
         std::unordered_map<uint64_t, tracy::GpuInstructionStats> stats;
     };
     std::vector<TempShader> tempShaders;
-    for( size_t elfIdx = 0; elfIdx < elfObjects.size(); elfIdx++ )
+    std::unordered_set<RgpPipelineHash, RgpPipelineHashHasher> insertedPipelineHashes;
+    for( size_t elfIdx = 0; elfIdx < shaderObjects.size(); elfIdx++ )
     {
-        const uint8_t* elfData = elfObjects[elfIdx].first;
-        const size_t elfSz     = elfObjects[elfIdx].second;
+        const auto& object = shaderObjects[elfIdx];
+        const auto& pipelineHash = object.metadata.pipelineHash;
+        if( pipelineHash.low == 0 || ambiguousPipelineHashes.count( pipelineHash.low ) ||
+            !shaderHashByPipeline.count( pipelineHash ) || !insertedPipelineHashes.insert( pipelineHash ).second ) continue;
 
-        if( elfSz < 64 ) continue;
+        TempShader ts {};
+        ts.pipelineHash = pipelineHash.low;
+        ts.shaderStage = object.metadata.shaderStage;
+        ts.vgprCount = object.metadata.vgprCount;
+        ts.sgprCount = object.metadata.sgprCount;
+        ts.ldsSize = object.metadata.ldsSize;
+        ts.maxOccupancy = static_cast<uint32_t>( maxSlots );
 
-        const uint64_t e_shoff = *reinterpret_cast<const uint64_t*>( elfData + 40 );
-        const uint16_t e_shentsize = *reinterpret_cast<const uint16_t*>( elfData + 58 );
-        const uint16_t e_shnum = *reinterpret_cast<const uint16_t*>( elfData + 60 );
-        const uint16_t e_shstrndx = *reinterpret_cast<const uint16_t*>( elfData + 62 );
-
-        if( e_shoff + static_cast<size_t>( e_shstrndx + 1 ) * e_shentsize > elfSz ) continue;
-
-        const uint64_t shstrOffset = *reinterpret_cast<const uint64_t*>( elfData + e_shoff + e_shstrndx * e_shentsize + 24 );
-
-        const uint8_t* textData = nullptr;
-        size_t textSize = 0;
-
-        for( uint16_t s = 0; s < e_shnum; s++ )
+        for( const auto& psoPipeline : psoPipelineHashes )
         {
-            const size_t secOffset = static_cast<size_t>( e_shoff + s * e_shentsize );
-            if( secOffset + 40 > elfSz ) break;
-
-            const uint32_t shName = *reinterpret_cast<const uint32_t*>( elfData + secOffset + 0 );
-            const uint64_t shSecOffset = *reinterpret_cast<const uint64_t*>( elfData + secOffset + 24 );
-            const uint64_t shSecSize = *reinterpret_cast<const uint64_t*>( elfData + secOffset + 32 );
-
-            if( shstrOffset + shName < elfSz )
+            if( ambiguousPsoHashes.count( psoPipeline.first ) || !( psoPipeline.second == pipelineHash ) ) continue;
+            const auto psoName = psoNames.find( psoPipeline.first );
+            if( psoName != psoNames.end() && !psoName->second.empty() )
             {
-                const char* secName = reinterpret_cast<const char*>( elfData + shstrOffset + shName );
-                if( strcmp( secName, ".text" ) == 0 && shSecOffset + shSecSize <= elfSz )
-                {
-                    textData = elfData + shSecOffset;
-                    textSize = static_cast<size_t>( shSecSize );
-                    break;
-                }
+                ts.name = psoName->second;
+                break;
             }
         }
-
-        if( textData && textSize > 0 )
+        if( ts.name.empty() )
         {
-            TempShader ts {};
-            const uint64_t pipelineHash = 0x1000 + elfIdx;
-            ts.pipelineHash = pipelineHash;
-            ts.shaderStage = 6; // Compute Stage
-            ts.vgprCount = 32;
-            ts.sgprCount = 48;
-            ts.ldsSize = 0;
-            ts.maxOccupancy = static_cast<uint32_t>( maxSlots );
-
-            char shNameBuf[64];
-            snprintf( shNameBuf, sizeof( shNameBuf ), "Shader_0x%llx", (unsigned long long)pipelineHash );
-            ts.name = shNameBuf;
-            // Disassemble instructions
-            size_t pc = 0;
-            while( pc + 4 <= textSize )
-            {
-                uint32_t dw0 = *reinterpret_cast<const uint32_t*>( textData + pc );
-                uint32_t dw1 = ( pc + 8 <= textSize ) ? *reinterpret_cast<const uint32_t*>( textData + pc + 4 ) : 0;
-                bool is64 = false;
-
-                DisasmResult dr = DisassembleAmdGpuInst( dw0, dw1 );
-                ts.lines.push_back( std::move( dr.text ) );
-                ts.pcs.push_back( pc );
-
-                tracy::GpuInstructionStats st {};
-                st.pc = pc;
-                st.issueCount = 1; // 1 issue in wave
-                st.totalActiveLanes = 32; // 32 active SIMD lanes
-                st.category = dr.category;
-                if( dr.category == 6 ) st.aluStallCycles = dr.latencyCycles; // Wait
-                else if( dr.category == 5 ) st.ldsStallCycles = dr.latencyCycles; // Barrier
-                else if( dr.category == 2 ) st.vmemStallCycles = dr.latencyCycles; // VMEM
-                else if( dr.category == 3 ) st.smemStallCycles = dr.latencyCycles; // SMEM
-                else if( dr.category == 4 ) st.ldsStallCycles = dr.latencyCycles; // LDS
-                else st.aluStallCycles = dr.latencyCycles; // VALU / SALU
-                ts.stats.emplace( pc, st );
-
-                pc += ( dr.is64Bit ? 8 : 4 );
-            }
-            printf( "  Disassembled shader ELF %zu: %zu instructions\n", elfIdx, ts.lines.size() );
-            tempShaders.push_back( std::move( ts ) );
+            char shaderName[64];
+            snprintf( shaderName, sizeof( shaderName ), "Shader_0x%016llx", (unsigned long long)ts.pipelineHash );
+            ts.name = shaderName;
         }
+
+        size_t pc = 0;
+        while( pc + 4 <= object.textSize )
+        {
+            const uint32_t dw0 = ReadElf32( object.textData + pc );
+            const uint32_t dw1 = ( pc + 8 <= object.textSize ) ? ReadElf32( object.textData + pc + 4 ) : 0;
+            DisasmResult dr = DisassembleAmdGpuInst( dw0, dw1 );
+            ts.lines.push_back( std::move( dr.text ) );
+            ts.pcs.push_back( pc );
+
+            tracy::GpuInstructionStats st {};
+            st.pc = pc;
+            st.issueCount = 1; // 1 issue in wave
+            st.totalActiveLanes = 32; // 32 active SIMD lanes
+            st.category = dr.category;
+            if( dr.category == 6 ) st.aluStallCycles = dr.latencyCycles; // Wait
+            else if( dr.category == 5 ) st.ldsStallCycles = dr.latencyCycles; // Barrier
+            else if( dr.category == 2 ) st.vmemStallCycles = dr.latencyCycles; // VMEM
+            else if( dr.category == 3 ) st.smemStallCycles = dr.latencyCycles; // SMEM
+            else if( dr.category == 4 ) st.ldsStallCycles = dr.latencyCycles; // LDS
+            else st.aluStallCycles = dr.latencyCycles; // VALU / SALU
+            ts.stats.emplace( pc, st );
+
+            pc += ( dr.is64Bit ? 8 : 4 );
+        }
+        printf( "  Disassembled shader ELF %zu (pipeline 0x%016llx): %zu instructions\n",
+            elfIdx, (unsigned long long)ts.pipelineHash, ts.lines.size() );
+        tempShaders.push_back( std::move( ts ) );
+    }
+
+    if( printStats )
+    {
+        printf( "  Shader pipeline join: %zu shaders, %zu distinct pipeline hashes, %zu code objects matched to loader events (%zu loader events)\n",
+            tempShaders.size(), insertedPipelineHashes.size(), matchedLoaderObjects, loaderEvents.size() );
     }
 
     // Sort and Rebase Timelines
