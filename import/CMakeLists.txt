@@ -33,6 +33,7 @@ target_link_libraries(tracy-import-fuchsia PRIVATE TracyServer)
 
 add_executable(tracy-import-rgp
     src/import-rgp.cpp
+    src/RgpIsa.cpp
     src/RgpSqtt.cpp
 )
 add_git_ref(tracy-import-rgp)

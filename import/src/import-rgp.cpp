@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <fstream>
 #include <functional>
 #include <memory>
@@ -32,6 +33,7 @@
 #include "../../server/TracyWorker.hpp"
 #include "../../public/common/TracyVersion.hpp"
 #include "GitRef.hpp"
+#include "RgpIsa.hpp"
 #include "RgpSqtt.hpp"
 
 namespace rgp_sqtt = tracy::rgp_sqtt;
@@ -613,7 +615,7 @@ static bool ParseRgpElfObject( const uint8_t* elfData, size_t elfSize, RgpElfObj
 void Usage()
 {
     printf( "tracy-import-rgp %i.%i.%i / %s\n\n", tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch, tracy::GitRef );
-    printf( "Usage: import-rgp [--stats] input.rgp output.tracy\n\n" );
+    printf( "Usage: import-rgp [--stats] [--llvm-objdump <path>] input.rgp output.tracy\n\n" );
     printf( "Imports AMD Radeon GPU Profiler (.rgp) traces into Tracy Profiler format.\n" );
     printf( "Supports:\n" );
     printf( "  - Wave-Slot execution timeline (CU -> SIMD -> Slot multi-wave concurrency)\n" );
@@ -622,6 +624,7 @@ void Usage()
     printf( "  - Command buffer submissions and synchronization markers\n" );
     printf( "  - Frame presentation marks\n" );
     printf( "  - SPM counter time-series plots (wavefront occupancy / GPU metrics)\n" );
+    printf( "  - LLVM AMDGPU disassembly via --llvm-objdump or TRACY_LLVM_OBJDUMP\n" );
     exit( 1 );
 }
 
@@ -685,276 +688,6 @@ static const char* GetQueueTypeName( uint8_t qtype )
     }
 }
 
-struct DisasmResult
-{
-    std::string text;
-    bool is64Bit;
-    uint8_t category; // 0: VALU, 1: SALU, 2: VMEM, 3: SMEM, 4: LDS, 5: Barrier, 6: Wait, 7: Branch, 8: Export
-    uint16_t latencyCycles;
-};
-
-static DisasmResult DisassembleAmdGpuInst( uint32_t dw0, uint32_t dw1 )
-{
-    DisasmResult res {};
-    res.is64Bit = false;
-    res.category = 0;
-    res.latencyCycles = 4;
-
-    const uint32_t top6 = ( dw0 >> 26 ) & 0x3F;
-    const uint32_t top2 = ( dw0 >> 30 ) & 0x3;
-    const uint32_t top1 = ( dw0 >> 31 ) & 0x1;
-
-    // Check SOPP: 0xBF800000 mask 0xFF800000
-    if( ( dw0 & 0xFF800000 ) == 0xBF800000 )
-    {
-        uint32_t op = ( dw0 >> 16 ) & 0x7F;
-        uint16_t simm = uint16_t( dw0 & 0xFFFF );
-        switch( op )
-        {
-        case 0:  res.text = "s_nop"; res.category = 1; res.latencyCycles = 1; return res;
-        case 1:  res.text = "s_endpgm"; res.category = 7; res.latencyCycles = 1; return res;
-        case 2:  res.text = "s_branch"; res.category = 7; res.latencyCycles = 4; return res;
-        case 3:  res.text = "s_cbranch_scc0"; res.category = 7; res.latencyCycles = 4; return res;
-        case 4:  res.text = "s_cbranch_scc1"; res.category = 7; res.latencyCycles = 4; return res;
-        case 5:  res.text = "s_cbranch_vccz"; res.category = 7; res.latencyCycles = 4; return res;
-        case 6:  res.text = "s_cbranch_vccnz"; res.category = 7; res.latencyCycles = 4; return res;
-        case 7:  res.text = "s_cbranch_execz"; res.category = 7; res.latencyCycles = 4; return res;
-        case 8:  res.text = "s_cbranch_execnz"; res.category = 7; res.latencyCycles = 4; return res;
-        case 10: res.text = "s_barrier"; res.category = 5; res.latencyCycles = 64; return res;
-        case 12: {
-            char buf[64];
-            snprintf( buf, sizeof( buf ), "s_waitcnt 0x%04x", simm );
-            res.text = buf;
-            res.category = 6;
-            res.latencyCycles = ( simm == 0xc07f ) ? 48 : 32;
-            return res;
-        }
-        case 13: res.text = "s_sethalt"; res.category = 7; res.latencyCycles = 1; return res;
-        case 14: res.text = "s_sleep"; res.category = 7; res.latencyCycles = 1; return res;
-        default: {
-            char buf[64];
-            snprintf( buf, sizeof( buf ), "s_sopp_%u 0x%04x", op, simm );
-            res.text = buf;
-            res.category = 1;
-            res.latencyCycles = 1;
-            return res;
-        }
-        }
-    }
-
-    // Check SOP1: 0xBE800000 mask 0xFF800000
-    if( ( dw0 & 0xFF800000 ) == 0xBE800000 )
-    {
-        uint32_t sdst = ( dw0 >> 16 ) & 0x7F;
-        uint32_t op = ( dw0 >> 8 ) & 0xFF;
-        uint32_t ssrc0 = dw0 & 0xFF;
-        const char* name = "s_mov_b32";
-        if( op == 1 ) name = "s_mov_b64";
-        else if( op == 2 ) name = "s_cmov_b32";
-        else if( op == 4 ) name = "s_not_b32";
-        else if( op == 28 ) name = "s_getpc_b64";
-        else if( op == 29 ) name = "s_setpc_b64";
-        else if( op == 30 ) name = "s_swappc_b64";
-        char buf[64];
-        snprintf( buf, sizeof( buf ), "%s s%u, s%u", name, sdst, ssrc0 );
-        res.text = buf;
-        res.category = 1;
-        res.latencyCycles = 1;
-        return res;
-    }
-
-    // Check SOPC: 0xBF000000 mask 0xFF800000
-    if( ( dw0 & 0xFF800000 ) == 0xBF000000 )
-    {
-        uint32_t op = ( dw0 >> 16 ) & 0x7F;
-        uint32_t ssrc1 = ( dw0 >> 8 ) & 0xFF;
-        uint32_t ssrc0 = dw0 & 0xFF;
-        const char* name = "s_cmp_eq_u32";
-        if( op == 8 ) name = "s_cmp_gt_u32";
-        else if( op == 9 ) name = "s_cmp_ge_u32";
-        else if( op == 10 ) name = "s_cmp_lt_u32";
-        else if( op == 11 ) name = "s_cmp_le_u32";
-        char buf[64];
-        snprintf( buf, sizeof( buf ), "%s s%u, s%u", name, ssrc0, ssrc1 );
-        res.text = buf;
-        res.category = 1;
-        res.latencyCycles = 1;
-        return res;
-    }
-
-    // Check SOPK: 0xB0000000 mask 0xF0000000
-    if( ( dw0 & 0xF0000000 ) == 0xB0000000 )
-    {
-        uint32_t sdst = ( dw0 >> 16 ) & 0x7F;
-        uint16_t simm = uint16_t( dw0 & 0xFFFF );
-        char buf[64];
-        snprintf( buf, sizeof( buf ), "s_movk_i32 s%u, 0x%04x", sdst, simm );
-        res.text = buf;
-        res.category = 1;
-        res.latencyCycles = 1;
-        return res;
-    }
-
-    // Check SOP2: bits [31:30] = 0b10 (0x80000000 mask 0xC0000000)
-    if( top2 == 0b10 )
-    {
-        uint32_t op = ( dw0 >> 23 ) & 0x7F;
-        uint32_t sdst = ( dw0 >> 16 ) & 0x7F;
-        uint32_t ssrc1 = ( dw0 >> 8 ) & 0xFF;
-        uint32_t ssrc0 = dw0 & 0xFF;
-        const char* name = "s_add_u32";
-        if( op == 1 ) name = "s_sub_u32";
-        else if( op == 12 ) name = "s_and_b32";
-        else if( op == 13 ) name = "s_or_b32";
-        else if( op == 14 ) name = "s_xor_b32";
-        else if( op == 20 ) name = "s_lshl_b32";
-        else if( op == 21 ) name = "s_lshr_b32";
-        else if( op == 24 ) name = "s_mul_i32";
-        char buf[64];
-        snprintf( buf, sizeof( buf ), "%s s%u, s%u, s%u", name, sdst, ssrc0, ssrc1 );
-        res.text = buf;
-        res.category = 1;
-        res.latencyCycles = 1;
-        return res;
-    }
-
-    // Check VOP1: 0x7E000000 mask 0xFE000000
-    if( ( dw0 & 0xFE000000 ) == 0x7E000000 )
-    {
-        uint32_t vdst = ( dw0 >> 17 ) & 0xFF;
-        uint32_t src0 = dw0 & 0x1FF;
-        char buf[64];
-        snprintf( buf, sizeof( buf ), "v_mov_b32 v%u, v%u", vdst, src0 );
-        res.text = buf;
-        res.category = 0;
-        res.latencyCycles = 4;
-        return res;
-    }
-
-    // Check VOPC: 0x7C000000 mask 0xFE000000
-    if( ( dw0 & 0xFE000000 ) == 0x7C000000 )
-    {
-        uint32_t vsrc1 = ( dw0 >> 9 ) & 0xFF;
-        uint32_t src0 = dw0 & 0x1FF;
-        char buf[64];
-        snprintf( buf, sizeof( buf ), "v_cmp_gt_f32 vcc, v%u, v%u", src0, vsrc1 );
-        res.text = buf;
-        res.category = 0;
-        res.latencyCycles = 4;
-        return res;
-    }
-
-    // Check VOP2: bits [31] = 0 (0x00000000 mask 0x80000000)
-    if( top1 == 0b0 )
-    {
-        uint32_t op = ( dw0 >> 25 ) & 0x3F;
-        uint32_t vdst = ( dw0 >> 17 ) & 0xFF;
-        uint32_t vsrc1 = ( dw0 >> 9 ) & 0xFF;
-        uint32_t src0 = dw0 & 0x1FF;
-        const char* name = "v_add_f32";
-        if( op == 0 ) name = "v_cndmask_b32";
-        else if( op == 2 ) name = "v_sub_f32";
-        else if( op == 4 ) name = "v_mul_f32";
-        else if( op == 8 ) name = "v_min_f32";
-        else if( op == 9 ) name = "v_max_f32";
-        else if( op == 14 ) name = "v_lshlrev_b32";
-        else if( op == 15 ) name = "v_lshrrev_b32";
-        char buf[64];
-        snprintf( buf, sizeof( buf ), "%s v%u, v%u, v%u", name, vdst, src0, vsrc1 );
-        res.text = buf;
-        res.category = 0;
-        res.latencyCycles = 4;
-        return res;
-    }
-
-    // Check SMEM (64-bit scalar memory): 0xF4000000 mask 0xFC000000
-    if( top6 == 0b111101 )
-    {
-        res.is64Bit = true;
-        uint32_t sdst = ( dw0 >> 6 ) & 0x7F;
-        uint32_t sbase = ( dw0 & 0x3F ) << 1;
-        char buf[64];
-        snprintf( buf, sizeof( buf ), "s_load_dwordx4 s[%u:%u], s[%u:%u]", sdst, sdst + 3, sbase, sbase + 1 );
-        res.text = buf;
-        res.category = 3;
-        res.latencyCycles = 40;
-        return res;
-    }
-
-    // Check VOP3 (64-bit): 0xD4000000 or 0xD7000000 mask 0xFC000000
-    if( top6 == 0b110101 || top6 == 0b110100 )
-    {
-        res.is64Bit = true;
-        uint32_t vdst = dw0 & 0xFF;
-        char buf[64];
-        snprintf( buf, sizeof( buf ), "v_fma_f32 v%u, v0, v1, v2", vdst );
-        res.text = buf;
-        res.category = 0;
-        res.latencyCycles = 4;
-        return res;
-    }
-
-    // Check MUBUF / MTBUF (64-bit): 0xE0000000 mask 0xFC000000 or 0xC8
-    if( top6 == 0b111000 || ( ( dw0 >> 24 ) == 0xc8 ) || ( ( dw0 >> 24 ) == 0xcc ) )
-    {
-        res.is64Bit = true;
-        uint32_t vdata = ( dw0 >> 12 ) & 0xFF;
-        uint32_t vaddr = dw0 & 0xFF;
-        char buf[64];
-        snprintf( buf, sizeof( buf ), "buffer_load_dword v%u, v%u, s[0:3], 0", vdata, vaddr );
-        res.text = buf;
-        res.category = 2;
-        res.latencyCycles = 220;
-        return res;
-    }
-
-    // Check FLAT / GLOBAL (64-bit): 0xDC000000 mask 0xFC000000
-    if( top6 == 0b110111 )
-    {
-        res.is64Bit = true;
-        uint32_t vdst = ( dw0 >> 24 ) & 0xFF;
-        char buf[64];
-        snprintf( buf, sizeof( buf ), "global_load_dword v%u, v[0:1], s[0:1]", vdst );
-        res.text = buf;
-        res.category = 2;
-        res.latencyCycles = 220;
-        return res;
-    }
-
-    // Check DS (64-bit LDS): 0xD8000000 mask 0xFC000000
-    if( top6 == 0b110110 )
-    {
-        res.is64Bit = true;
-        uint32_t vdst = ( dw0 >> 8 ) & 0xFF;
-        char buf[64];
-        snprintf( buf, sizeof( buf ), "ds_read_b32 v%u, v0", vdst );
-        res.text = buf;
-        res.category = 4;
-        res.latencyCycles = 16;
-        return res;
-    }
-
-    // Check EXP (64-bit export): 0xF8000000 mask 0xFC000000
-    if( top6 == 0b111110 )
-    {
-        res.is64Bit = true;
-        char buf[64];
-        snprintf( buf, sizeof( buf ), "exp pos0, v0, v1, v2, v3" );
-        res.text = buf;
-        res.category = 8;
-        res.latencyCycles = 16;
-        return res;
-    }
-
-    // Literal constant
-    char buf[64];
-    snprintf( buf, sizeof( buf ), "literal_dword 0x%08x", dw0 );
-    res.text = buf;
-    res.category = 1;
-    res.latencyCycles = 0;
-    return res;
-}
-
 int main( int argc, char** argv )
 {
 #ifdef _WIN32
@@ -968,11 +701,25 @@ int main( int argc, char** argv )
     tracy::FileCompression clev = tracy::FileCompression::Fast;
 
     bool printStats = false;
+    const char* llvmObjdump = getenv( "TRACY_LLVM_OBJDUMP" );
     int arg = 1;
     if( argc > arg && strcmp( argv[arg], "--stats" ) == 0 )
     {
-        printStats = true;
-        arg++;
+        if( strcmp( argv[arg], "--stats" ) == 0 )
+        {
+            printStats = true;
+            arg++;
+        }
+        else if( strcmp( argv[arg], "--llvm-objdump" ) == 0 )
+        {
+            if( argc <= arg + 1 ) Usage();
+            llvmObjdump = argv[arg + 1];
+            arg += 2;
+        }
+        else
+        {
+            break;
+        }
     }
     if( argc != arg + 2 ) Usage();
 
@@ -1299,11 +1046,17 @@ int main( int argc, char** argv )
     }
 
     std::vector<RgpElfObject> shaderObjects;
+    std::vector<std::pair<const uint8_t*, size_t>> shaderElfObjects;
     shaderObjects.reserve( elfObjects.size() );
+    shaderElfObjects.reserve( elfObjects.size() );
     for( const auto& elf : elfObjects )
     {
         RgpElfObject object;
-        if( ParseRgpElfObject( elf.first, elf.second, object ) ) shaderObjects.push_back( std::move( object ) );
+        if( ParseRgpElfObject( elf.first, elf.second, object ) )
+        {
+            shaderObjects.push_back( std::move( object ) );
+            shaderElfObjects.push_back( elf );
+        }
     }
 
     std::unordered_map<uint64_t, RgpPipelineHash> pipelineHashOwners;
@@ -2352,6 +2105,18 @@ int main( int argc, char** argv )
     };
     std::vector<TempShader> tempShaders;
     std::unordered_set<RgpPipelineHash, RgpPipelineHashHasher> insertedPipelineHashes;
+    std::string asicName = gpuName;
+    std::transform( asicName.begin(), asicName.end(), asicName.begin(), []( unsigned char c ) { return static_cast<char>( std::tolower( c ) ); } );
+    std::string mcpu;
+    if( asicName.find( "navi22" ) != std::string::npos || asicName.find( "navi 22" ) != std::string::npos || asicName.find( "gfx1031" ) != std::string::npos ) mcpu = "gfx1031";
+    else if( asicName.find( "navi10" ) != std::string::npos || asicName.find( "navi 10" ) != std::string::npos || asicName.find( "gfx1010" ) != std::string::npos ) mcpu = "gfx1010";
+    else if( asicName.find( "navi31" ) != std::string::npos || asicName.find( "bioshock" ) != std::string::npos || asicName.find( "gfx1100" ) != std::string::npos ) mcpu = "gfx1100";
+    else if( asicName.find( "navi48" ) != std::string::npos || asicName.find( "gfx1200" ) != std::string::npos ) mcpu = "gfx1200";
+    else if( sqttGfxipLevel == 0x9 ) mcpu = "gfx1030";
+    else if( sqttGfxipLevel == 0xA || sqttGfxipLevel == 0xC ) mcpu = "gfx1100";
+    else if( sqttGfxipLevel == 0xD ) mcpu = "gfx1150";
+    else if( sqttGfxipLevel == 0x10 ) mcpu = "gfx1200";
+    else mcpu = "gfx1030";
     for( size_t elfIdx = 0; elfIdx < shaderObjects.size(); elfIdx++ )
     {
         const auto& object = shaderObjects[elfIdx];
@@ -2384,8 +2149,15 @@ int main( int argc, char** argv )
             ts.name = shaderName;
         }
 
-        size_t pc = 0;
-        while( pc + 4 <= object.textSize )
+        std::vector<tracy::rgp_isa::IsaInst> instructions;
+        std::string disasmError;
+        const auto& elf = shaderElfObjects[elfIdx];
+        if( !tracy::rgp_isa::DisassembleCodeObject( elf.first, elf.second, mcpu.c_str(), llvmObjdump, instructions, disasmError ) )
+        {
+            fprintf( stderr, "Failed to disassemble shader ELF %zu: %s\n", elfIdx, disasmError.c_str() );
+            continue;
+        }
+        if( !disasmError.empty() )
         {
             const uint32_t dw0 = ReadElf32( object.textData + pc );
             const uint32_t dw1 = ( pc + 8 <= object.textSize ) ? ReadElf32( object.textData + pc + 4 ) : 0;
