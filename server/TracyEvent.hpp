@@ -852,7 +852,7 @@ struct GpuWavefront
     uint32_t workgroupY : 10;
     uint32_t workgroupZ : 10;
     uint32_t reserved   : 2;
-    uint32_t pipelineHash;
+    uint64_t pipelineHash;
     uint32_t stateStartIndex;
     uint32_t stateCount;
     uint32_t waveId;

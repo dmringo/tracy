@@ -59,6 +59,24 @@ constexpr size_t FileHeaderMagic = 5;
 static const int CurrentVersion = FileVersion( Version::Major, Version::Minor, Version::Patch );
 static const int MinSupportedVersion = FileVersion( 0, 11, 0 );
 static const int VersionWithGpuWaveSlots = FileVersion( 0, 14, 3 );
+static const int VersionWithGpuWavePipelineHash = FileVersion( 0, 14, 4 );
+
+#pragma pack( push, 1 )
+struct GpuWavefrontV143
+{
+    Int48 start;
+    Int48 end;
+    uint32_t workgroupX : 10;
+    uint32_t workgroupY : 10;
+    uint32_t workgroupZ : 10;
+    uint32_t reserved   : 2;
+    uint32_t pipelineHash;
+    uint32_t stateStartIndex;
+    uint32_t stateCount;
+    uint32_t waveId;
+};
+#pragma pack( pop )
+static_assert( sizeof( GpuWavefrontV143 ) == 32 );
 
 
 
@@ -1646,7 +1664,30 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                     if( numWaves > 0 )
                     {
                         slot.waves.reserve_exact( numWaves, m_slab );
-                        f.Read( slot.waves.data(), sizeof( GpuWavefront ) * numWaves );
+                        if( fileVer >= VersionWithGpuWavePipelineHash )
+                        {
+                            f.Read( slot.waves.data(), sizeof( GpuWavefront ) * numWaves );
+                        }
+                        else
+                        {
+                            std::vector<GpuWavefrontV143> oldWaves( numWaves );
+                            f.Read( oldWaves.data(), sizeof( GpuWavefrontV143 ) * numWaves );
+                            for( uint32_t w = 0; w < numWaves; w++ )
+                            {
+                                auto& wave = slot.waves[w];
+                                const auto& oldWave = oldWaves[w];
+                                wave.start = oldWave.start;
+                                wave.end = oldWave.end;
+                                wave.workgroupX = oldWave.workgroupX;
+                                wave.workgroupY = oldWave.workgroupY;
+                                wave.workgroupZ = oldWave.workgroupZ;
+                                wave.reserved = oldWave.reserved;
+                                wave.pipelineHash = oldWave.pipelineHash;
+                                wave.stateStartIndex = oldWave.stateStartIndex;
+                                wave.stateCount = oldWave.stateCount;
+                                wave.waveId = oldWave.waveId;
+                            }
+                        }
                         const int64_t wEnd = slot.waves.back().end.Val();
                         if( m_data.lastTime < wEnd ) m_data.lastTime = wEnd;
                     }
