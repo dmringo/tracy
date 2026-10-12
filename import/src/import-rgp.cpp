@@ -1249,6 +1249,7 @@ int main( int argc, char** argv )
         uint64_t shaderTimestamp = 0;
         uint64_t realtimeEpoch = 0;
         uint64_t previousRealtimeRaw = 0;
+        uint64_t previousRealtimeExtended = 0;
         bool hasRealtimeTimestamp = false;
         auto& points = streamRealtimePoints[streamIndex];
 
@@ -1268,6 +1269,7 @@ int main( int argc, char** argv )
             uint64_t realtimeTimestamp;
             if( GetRealtimeTimestamp( sqttArch, token, realtimeTimestamp ) )
             {
+                bool validRealtimeTimestamp = true;
                 if( sqttArch != SqttArch::Gfx10 )
                 {
                     const uint8_t timestampWidth = sqttArch == SqttArch::Gfx12 ? 52 : 36;
@@ -1285,16 +1287,38 @@ int main( int argc, char** argv )
                         {
                             realtimeEpoch -= modulus;
                         }
+                        realtimeTimestamp += realtimeEpoch;
+                        previousRealtimeRaw = realtimeTimestamp & timestampMask;
+                        previousRealtimeExtended = realtimeTimestamp;
+                        hasRealtimeTimestamp = true;
                     }
-                    else if( realtimeTimestamp < previousRealtimeRaw && previousRealtimeRaw - realtimeTimestamp > modulus / 2 )
+                    else if( sqttArch == SqttArch::Gfx11 )
                     {
-                        realtimeEpoch += modulus;
+                        uint64_t mergedTimestamp;
+                        if( !rgp_sqtt::MergePartialTimestamp( realtimeTimestamp, previousRealtimeExtended, timestampMask,
+                                (std::max)( gpuTimestampFreq, uint64_t( 1 ) ), mergedTimestamp ) )
+                        {
+                            validRealtimeTimestamp = false;
+                        }
+                        else
+                        {
+                            realtimeTimestamp = mergedTimestamp;
+                            previousRealtimeRaw = realtimeTimestamp & timestampMask;
+                            previousRealtimeExtended = realtimeTimestamp;
+                        }
                     }
-                    previousRealtimeRaw = realtimeTimestamp;
-                    hasRealtimeTimestamp = true;
-                    realtimeTimestamp += realtimeEpoch;
+                    else
+                    {
+                        if( realtimeTimestamp < previousRealtimeRaw && previousRealtimeRaw - realtimeTimestamp > modulus / 2 )
+                        {
+                            realtimeEpoch += modulus;
+                        }
+                        previousRealtimeRaw = realtimeTimestamp;
+                        realtimeTimestamp += realtimeEpoch;
+                        previousRealtimeExtended = realtimeTimestamp;
+                    }
                 }
-                points.push_back( SqttRealtimePoint { shaderTimestamp, realtimeTimestamp } );
+                if( validRealtimeTimestamp ) points.push_back( SqttRealtimePoint { shaderTimestamp, realtimeTimestamp } );
             }
 
             bitpos += info.token_len;
@@ -1488,6 +1512,9 @@ int main( int argc, char** argv )
     }
 
     std::array<size_t, 5> markerZoneCounts {};
+    std::map<uint32_t, size_t> markerApiTypeCounts;
+    std::map<uint32_t, size_t> generalApiTypeCounts;
+    std::unordered_set<uint32_t> markerCommandBufferIds;
     size_t dispatchZonesWithPipeline = 0;
     size_t dispatchZonesWithShader = 0;
     size_t dispatchZonesTotal = 0;
@@ -1495,6 +1522,14 @@ int main( int argc, char** argv )
     size_t unmatchedMarkers = 0;
     size_t selectedMarkerCount = 0;
     int selectedMarkerSe = -1;
+    size_t drawMarkerCount = 0;
+    int64_t firstDrawMarkerTime = 0;
+    bool hasFirstDrawMarkerTime = false;
+    size_t thirdDrawZoneIndex = SIZE_MAX;
+    uint64_t thirdDrawPsoHash = 0;
+    std::array<uint32_t, 4> thirdDrawArgs {};
+    bool thirdDrawHasArgs = false;
+    size_t drawArgumentsPrinted = 0;
     if( printStats )
     {
         static constexpr std::array<const char*, 6> markerNames = {
@@ -1562,6 +1597,12 @@ int main( int argc, char** argv )
         selectedMarkerCount = decoded.markers.size();
         markerDecodeErrors = decoded.errors;
         selectedMarkerSe = sqttStreams[selectedMarkerStream].first.shader_engine_index;
+        for( const auto& marker : decoded.markers )
+        {
+            if( marker.identifier == MARKER_CB_START ) markerCommandBufferIds.insert( marker.cbId );
+            else if( marker.identifier == MARKER_EVENT ) markerApiTypeCounts[marker.apiType]++;
+            else if( marker.identifier == MARKER_GENERAL_API ) generalApiTypeCounts[marker.apiType]++;
+        }
         auto FindSubmitSpan = [&]( uint32_t cbId, int64_t time ) -> const SubmitSpan* {
             const SubmitSpan* match = nullptr;
             int64_t bestDistance = INT64_MAX;
@@ -1588,6 +1629,35 @@ int main( int argc, char** argv )
         auto MarkerTimeNs = [&]( const SqttMarker& marker ) {
             return GpuTickToNs( ShaderTickToGpuTick( streamPoints, marker.shaderTimestamp ) );
         };
+        if( submitSpans.empty() )
+        {
+            std::unordered_map<uint32_t, int64_t> openSyntheticSpans;
+            int64_t lastMarkerTime = INT64_MIN;
+            for( const auto& marker : decoded.markers )
+            {
+                const int64_t time = MarkerTimeNs( marker );
+                lastMarkerTime = (std::max)( lastMarkerTime, time );
+                if( marker.identifier == MARKER_CB_START ) openSyntheticSpans[marker.cbId] = time;
+                else if( marker.identifier == MARKER_CB_END )
+                {
+                    const auto start = openSyntheticSpans.find( marker.cbId );
+                    if( start != openSyntheticSpans.end() )
+                    {
+                        submitSpans.push_back( SubmitSpan { 0, marker.cbId, start->second, (std::max)( start->second, time ) } );
+                        openSyntheticSpans.erase( start );
+                    }
+                }
+            }
+            for( const auto& openSpan : openSyntheticSpans )
+            {
+                const int64_t end = (std::max)( openSpan.second, lastMarkerTime );
+                submitSpans.push_back( SubmitSpan { 0, openSpan.first, openSpan.second, end } );
+            }
+            if( printStats )
+            {
+                printf( "  No queue submit spans; synthesized %zu queue-0 command-buffer spans from SQTT markers\n", submitSpans.size() );
+            }
+        }
         struct OpenMarkerZone
         {
             size_t zoneIndex;
@@ -1624,17 +1694,13 @@ int main( int argc, char** argv )
         auto EventName = []( uint32_t type ) -> const char* {
             switch( type )
             {
-            case 0: return "Draw";
-            case 1: return "DrawIndexed";
-            case 2: return "DrawIndirect";
-            case 3: return "DrawIndexedIndirect";
-            case 4: return "DrawIndirectCountAMD";
-            case 5: return "DrawIndexedIndirectCountAMD";
-            case 6: return "Dispatch";
-            case 7: return "DispatchIndirect";
-            case 41: return "DrawMeshTasks";
-            case 42: return "DrawMeshTasksIndirectCount";
-            case 43: return "DrawMeshTasksIndirect";
+            case 6: return "CmdDispatch";
+            case 9: return "CmdCopyImage";
+            case 11: return "CmdCopyBufferToImage";
+            case 22: return "vkCmdCopyQueryPoolResults";
+            case 23: return "CmdRenderPassColorClear";
+            case 24: return "CmdRenderPassDepthStencilClear";
+            case 26: return "CmdDraw";
             default: return "GPU Event";
             }
         };
@@ -1642,6 +1708,15 @@ int main( int argc, char** argv )
         for( const auto& marker : decoded.markers )
         {
             const int64_t time = MarkerTimeNs( marker );
+            if( marker.identifier == MARKER_EVENT && marker.apiType == 26 )
+            {
+                drawMarkerCount++;
+                if( !hasFirstDrawMarkerTime )
+                {
+                    firstDrawMarkerTime = time;
+                    hasFirstDrawMarkerTime = true;
+                }
+            }
             const SubmitSpan* span = FindSubmitSpan( marker.cbId, time );
             if( marker.identifier == MARKER_CB_START ) boundPipelinesByCb.erase( marker.cbId );
             else if( marker.identifier == MARKER_CB_END ) boundPipelinesByCb.erase( marker.cbId );
@@ -1658,8 +1733,9 @@ int main( int argc, char** argv )
                     unmatchedMarkers++;
                     continue;
                 }
-                const size_t zoneIndex = AddMarkerZone( *span, time, span->end,
-                    "Command Buffer " + std::to_string( marker.cbId ), "", 1, 0 );
+                char zoneName[96];
+                snprintf( zoneName, sizeof( zoneName ), "Command Buffer %u (RGP 0x%05X)", marker.cbId, marker.rawCbId );
+                const size_t zoneIndex = AddMarkerZone( *span, time, span->end, zoneName, "", 1, 0 );
                 openCommandBuffers[marker.cbId] = zoneIndex;
                 commandBufferSpans[marker.cbId] = span;
                 continue;
@@ -1704,11 +1780,27 @@ int main( int argc, char** argv )
                 CloseEvent( marker.cbId, time );
                 std::string name = EventName( marker.apiType );
                 std::string text = "Command " + std::to_string( marker.apiType );
+                if( marker.hasApiArgs )
+                {
+                    char args[64];
+                    snprintf( args, sizeof( args ), "(%u,%u,%u,%u)", marker.apiArgs[0], marker.apiArgs[1],
+                        marker.apiArgs[2], marker.apiArgs[3] );
+                    name += args;
+                }
                 const auto boundPipeline = boundPipelinesByCb.find( marker.cbId );
-                const uint64_t apiPsoHash = boundPipeline == boundPipelinesByCb.end() ? 0 : boundPipeline->second;
+                const uint64_t apiPsoHash = boundPipeline == boundPipelinesByCb.end() || boundPipeline->second == 0 ?
+                    marker.pipelineHash : boundPipeline->second;
+                if( printStats && marker.apiType == 26 && marker.hasApiArgs && drawArgumentsPrinted < 16 )
+                {
+                    printf( "  Debug draw args #%zu at %lld ns: (%u,%u,%u,%u), marker PSO 0x%016llX, bound PSO 0x%016llX\n",
+                        drawArgumentsPrinted + 1, (long long)time, marker.apiArgs[0], marker.apiArgs[1], marker.apiArgs[2],
+                        marker.apiArgs[3], (unsigned long long)marker.pipelineHash,
+                        (unsigned long long)( boundPipeline == boundPipelinesByCb.end() ? 0 : boundPipeline->second ) );
+                    drawArgumentsPrinted++;
+                }
                 const auto psoName = psoNames.find( apiPsoHash );
                 if( psoName != psoNames.end() && !psoName->second.empty() ) name += " - " + psoName->second;
-                const bool isDrawOrDispatch = marker.apiType <= 7 || ( marker.apiType >= 41 && marker.apiType <= 43 );
+                const bool isDrawOrDispatch = marker.apiType == 6 || marker.apiType == 26;
                 if( isDrawOrDispatch )
                 {
                     dispatchZonesTotal++;
@@ -1735,6 +1827,13 @@ int main( int argc, char** argv )
                 const size_t zoneIndex = AddMarkerZone( *span, time, span->end, name,
                     text, 2, 1 );
                 openEvents[marker.cbId] = OpenMarkerZone { zoneIndex, span };
+                if( marker.apiType == 26 && drawMarkerCount == 3 )
+                {
+                    thirdDrawZoneIndex = zoneIndex;
+                    thirdDrawPsoHash = apiPsoHash;
+                    thirdDrawArgs = marker.apiArgs;
+                    thirdDrawHasArgs = marker.hasApiArgs;
+                }
             }
             else if( marker.identifier == MARKER_BARRIER_START )
             {
@@ -1777,6 +1876,11 @@ int main( int argc, char** argv )
             else if( marker.identifier == MARKER_LAYOUT_TRANSITION )
             {
                 AddMarkerZone( *span, time, time + 1, "Layout Transition", "", 2, 4 );
+            }
+            else if( marker.identifier == MARKER_GENERAL_API )
+            {
+                const std::string name = "API " + std::to_string( marker.apiType );
+                AddMarkerZone( *span, time, time + 1, name, name, 2, 1 );
             }
         }
 
@@ -1832,8 +1936,27 @@ int main( int argc, char** argv )
         }
         printf( "  Marker zones: command buffers %zu, events %zu, barriers %zu, user events %zu, layout transitions %zu\n",
             markerZoneCounts[0], markerZoneCounts[1], markerZoneCounts[2], markerZoneCounts[3], markerZoneCounts[4] );
+        printf( "  Command-buffer IDs in SQTT markers: %zu\n", markerCommandBufferIds.size() );
+        for( const auto& [apiType, count] : markerApiTypeCounts )
+        {
+            printf( "  SQTT EVENT apiType %u: %zu\n", apiType, count );
+        }
+        for( const auto& [apiType, count] : generalApiTypeCounts )
+        {
+            printf( "  SQTT GENERAL_API apiType %u: %zu\n", apiType, count );
+        }
         printf( "  Draw/dispatch zones with bound pipeline: %zu/%zu; resolved shader: %zu/%zu\n",
             dispatchZonesWithPipeline, dispatchZonesTotal, dispatchZonesWithShader, dispatchZonesTotal );
+        if( thirdDrawZoneIndex != SIZE_MAX && thirdDrawZoneIndex < pendingZones.size() && hasFirstDrawMarkerTime )
+        {
+            const auto& zone = pendingZones[thirdDrawZoneIndex];
+            printf( "  Third CmdDraw(%u,%u,%u,%u) relative to first CmdDraw: %.3f us, duration %.3f us, PSO 0x%016llX\n",
+                thirdDrawHasArgs ? thirdDrawArgs[0] : 0, thirdDrawHasArgs ? thirdDrawArgs[1] : 0,
+                thirdDrawHasArgs ? thirdDrawArgs[2] : 0, thirdDrawHasArgs ? thirdDrawArgs[3] : 0,
+                static_cast<double>( zone.start - firstDrawMarkerTime ) / 1000.0,
+                static_cast<double>( zone.end - zone.start ) / 1000.0,
+                static_cast<unsigned long long>( thirdDrawPsoHash ) );
+        }
     }
 
     // Decode SQTT Wavefront and Wave Slot Concurrency
@@ -1979,8 +2102,7 @@ int main( int argc, char** argv )
                 continue;
             }
             const uint64_t previousGpuTime = currentGpuTime;
-            const uint64_t timeDelta = GetTokenTimeDelta( sqttArch, token );
-            currentGpuTime += timeDelta;
+            currentGpuTime += GetTokenTimeDelta( sqttArch, token );
 
             if( info.type == TOKEN_WAVE_START || info.type == TOKEN_WAVE_START_EXT )
             {
@@ -2089,7 +2211,7 @@ int main( int argc, char** argv )
                     {
                         const int64_t sliceStart = StreamTickToNs( previousGpuTime );
                         const int64_t sliceEnd = StreamTickToNs( currentGpuTime );
-                        if( timeDelta > 0 && sliceEnd > sliceStart )
+                        if( currentGpuTime > previousGpuTime && sliceEnd > sliceStart )
                         {
                             tracy::GpuWaveStateSlice slice {};
                             slice.start = sliceStart;
